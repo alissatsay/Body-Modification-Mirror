@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Env / secrets
+.env
+
+# Logs / outputs
+*.log
+
+# Optional: if you generate lots of output frames/videos, consider ignoring:
+# saved_frames/
+# outputs/
