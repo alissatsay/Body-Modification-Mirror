@@ -11,8 +11,8 @@ kiwisolver==1.4.9
 matplotlib==3.10.8
 mediapipe==0.10.21
 ml_dtypes==0.5.4
-numpy==2.4.1
-opencv-contrib-python==4.13.0.90
+numpy==1.26.4
+opencv-python==4.10.0.84
 opt_einsum==3.4.0
 packaging==25.0
 pillow==12.1.0
@@ -24,3 +24,4 @@ scipy==1.17.0
 sentencepiece==0.2.1
 six==1.17.0
 sounddevice==0.5.3
+
