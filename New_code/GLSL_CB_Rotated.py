@@ -67,6 +67,7 @@ def get_hip_center_and_peakY_from_pose(results, vis_thresh=0.6):
     left_hip = lm[mp_pose.PoseLandmark.LEFT_HIP.value]
     right_hip = lm[mp_pose.PoseLandmark.RIGHT_HIP.value]
 
+    # Require sufficient visibility to avoid "tracking the wall"
     if left_hip.visibility < vis_thresh or right_hip.visibility < vis_thresh:
         return None, None
 
@@ -82,6 +83,7 @@ def get_index_y_from_pose(results, vis_thresh=0.6):
     """
     Returns normalized y in [0,1] for the index finger (using Pose landmarks),
     or None if not available / not reliable (visibility below threshold).
+    Uses RIGHT_INDEX and LEFT_INDEX if present and visible.
     """
     if not results.pose_landmarks:
         return None
@@ -109,20 +111,23 @@ def get_index_y_from_pose(results, vis_thresh=0.6):
 def composite_person_over_bg(person_bgr, seg_mask, bg_bgr=None, thresh=0.5, feather_px=5):
     """
     person_bgr : (H,W,3) warped+mirrored person frame
-    seg_mask   : (H,W) float32 [0..1] from MediaPipe segmenter (aligned to person_bgr)
+    seg_mask   : (H,W) float32 [0..1] from MediaPipe segmenter
     bg_bgr     : (H,W,3) background image to fill (if None, uses white)
     """
     h, w = person_bgr.shape[:2]
 
+    # Prepare background
     if bg_bgr is None:
-        bg_f32 = np.ones_like(person_bgr, dtype=np.float32) * 255.0
+        bg_f32 = np.ones_like(person_bgr, dtype=np.float32) * 255.0  # white
     else:
         if bg_bgr.shape[:2] != (h, w):
             bg_bgr = cv2.resize(bg_bgr, (w, h), interpolation=cv2.INTER_LINEAR)
         bg_f32 = bg_bgr.astype(np.float32)
 
+    # Person mask
     person_mask = (seg_mask >= thresh).astype(np.float32)
 
+    # Feather edges
     if feather_px > 0:
         k = max(1, int(feather_px))
         if k % 2 == 0:
@@ -130,6 +135,7 @@ def composite_person_over_bg(person_bgr, seg_mask, bg_bgr=None, thresh=0.5, feat
         person_mask = cv2.GaussianBlur(person_mask, (k, k), 0)
 
     mask_3 = np.dstack([person_mask] * 3)
+
     person_f32 = person_bgr.astype(np.float32)
     out = mask_3 * person_f32 + (1.0 - mask_3) * bg_f32
     return out.astype(np.uint8)
@@ -150,6 +156,7 @@ def main():
         print("Error: couldn't read initial frame.")
         cap.release()
         return
+    frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     height, width = frame.shape[:2]
 
     # Capture a clean background
@@ -157,7 +164,8 @@ def main():
     cv2.waitKey(3000)
     ret, captured_bg = cap.read()
     if ret:
-        captured_bg = cv2.flip(captured_bg, 1)  # keep background in mirrored coordinates
+        captured_bg = cv2.rotate(captured_bg, cv2.ROTATE_90_CLOCKWISE)
+        captured_bg = cv2.flip(captured_bg, 1)
         print("Background captured.")
     else:
         captured_bg = None
@@ -180,7 +188,8 @@ def main():
     max_step_y = 0.03
     max_step_idx = 0.05
 
-    vis_thresh = 0.6  # landmark visibility threshold
+    # Visibility gating threshold for trusting landmarks
+    vis_thresh = 0.6
 
     with mp_pose.Pose(
         static_image_mode=False,
@@ -196,34 +205,32 @@ def main():
             if not ret:
                 break
 
-            # ------------------------------------------------------------
-            # NEW ORDERING:
-            # 1) Mirror original frame first
-            # 2) Run pose + segmentation on mirrored_orig (unwarped)
-            # 3) Build warp maps in mirrored coordinate system
-            # 4) Warp both image and segmentation mask with the same map
-            # ------------------------------------------------------------
-            mirrored_orig = cv2.flip(frame, 1)
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 
-            # Pose on mirrored_orig for consistent coordinate space
-            rgb_for_pose = cv2.cvtColor(mirrored_orig, cv2.COLOR_BGR2RGB)
+            # Pose on the original frame (unchanged from your pipeline)
+            rgb_for_pose = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pose_results = pose.process(rgb_for_pose)
 
-            # Stabilized hips (visibility-gated)
+            # --- Stabilized hips (visibility-gated) ---
             uCenterX_raw, uPeakY_raw = get_hip_center_and_peakY_from_pose(
                 pose_results, vis_thresh=vis_thresh
             )
+
             if uCenterX_raw is None or uPeakY_raw is None:
+                # hold last good; if none yet, use fallback
                 uCenterX_raw = prev_centerX if prev_centerX is not None else fallback_centerX
                 uPeakY_raw = prev_peakY if prev_peakY is not None else fallback_peakY
 
+            # clamp sudden jumps, then smooth
             uCenterX_raw = clamp_delta(prev_centerX, uCenterX_raw, max_step_x)
             uPeakY_raw = clamp_delta(prev_peakY, uPeakY_raw, max_step_y)
+
             uCenterX = ema(prev_centerX, uCenterX_raw, alpha_pose)
             uPeakY = ema(prev_peakY, uPeakY_raw, alpha_pose)
+
             prev_centerX, prev_peakY = uCenterX, uPeakY
 
-            # Stabilized index y (visibility-gated)
+            # --- Stabilized index y (visibility-gated) ---
             index_y_raw = get_index_y_from_pose(pose_results, vis_thresh=vis_thresh)
             if index_y_raw is None:
                 index_y_raw = prev_indexY if prev_indexY is not None else fallback_index_y_norm
@@ -234,23 +241,15 @@ def main():
 
             cut_line = int((index_y_norm + 0.1) * (height - 1))
 
-            # Build warp maps and warp mirrored_orig
+            # Build warp & warp
             map_x, map_y = build_warp_maps(width, height, uCenterX, uPeakY, uGain, sigma_y)
-            mirrored_warped = warp_frame(mirrored_orig, map_x, map_y)
+            warped = warp_frame(frame, map_x, map_y)
 
-            # Segmentation on mirrored_orig (NOT warped)
-            rgb_for_seg = cv2.cvtColor(mirrored_orig, cv2.COLOR_BGR2RGB)
-            seg_results = segmenter.process(rgb_for_seg)
-            seg_mask = seg_results.segmentation_mask.astype(np.float32)  # (H,W)
+            # Mirror (selfie/mirror view) for both warped person and original frame
+            mirrored = cv2.flip(warped, 1)
+            mirrored_orig = cv2.flip(frame, 1)
 
-            # Warp the segmentation mask with the same map
-            seg_mask_warped = cv2.remap(
-                seg_mask, map_x, map_y,
-                interpolation=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_REPLICATE
-            )
-
-            # Build background in the same mirrored coordinate system
+            # build background
             if captured_bg is not None:
                 combined_bg = captured_bg.copy()
             else:
@@ -259,19 +258,25 @@ def main():
             if combined_bg.shape[:2] != (height, width):
                 combined_bg = cv2.resize(combined_bg, (width, height), interpolation=cv2.INTER_LINEAR)
 
-            # Below cut_line: show the ORIGINAL mirrored frame; above: show captured background
+            # Whatever is BELOW the index y coordinate is the ORIGINAL FRAME
+            # Whatever is ABOVE is the captured background (already in combined_bg)
             if 0 <= cut_line < height:
                 combined_bg[cut_line:, :, :] = mirrored_orig[cut_line:, :, :]
 
-            # Composite warped person using the WARPED mask over the combined background
+            # Segmentation on mirrored (warped person) [unchanged]
+            rgb_for_seg = cv2.cvtColor(mirrored, cv2.COLOR_BGR2RGB)
+            seg_results = segmenter.process(rgb_for_seg)
+            seg_mask = seg_results.segmentation_mask  # (H,W) float32
+
+            # Composite warped person over the combined background
             final_frame = composite_person_over_bg(
-                mirrored_warped, seg_mask_warped, bg_bgr=combined_bg, thresh=0.5, feather_px=5
+                mirrored, seg_mask, bg_bgr=combined_bg, thresh=0.5, feather_px=5
             )
 
             cv2.imshow("Warped Mirror over Combined Background", final_frame)
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
+            if key == ord('q'):
                 break
 
     cap.release()
