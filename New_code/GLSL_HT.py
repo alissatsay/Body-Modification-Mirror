@@ -6,7 +6,7 @@ import time
 # -----------------------------
 # Global rotation controls
 # -----------------------------
-ROTATE_DEG = 0                 # any angle (degrees)
+ROTATE_DEG = 90                 # any angle (degrees)
 ROTATE_DIR = "ccw"              # "ccw" or "cw"
 
 mp_pose = mp.solutions.pose
