@@ -3,9 +3,6 @@ import numpy as np
 import mediapipe as mp
 import time
 
-# -----------------------------
-# Global rotation controls
-# -----------------------------
 ROTATE_DEG = 90                 # any angle (degrees)
 ROTATE_DIR = "ccw"              # "ccw" or "cw"
 
@@ -13,9 +10,6 @@ mp_pose = mp.solutions.pose
 mp_selfie_segmentation = mp.solutions.selfie_segmentation
 
 
-# -----------------------------
-# Frame rotation (FIRST function)
-# -----------------------------
 def rotate_frame(frame_bgr, deg=ROTATE_DEG, direction=ROTATE_DIR):
     """
     Rotate an image by deg degrees in the requested direction.
@@ -67,9 +61,6 @@ def rotate_frame(frame_bgr, deg=ROTATE_DEG, direction=ROTATE_DIR):
     )
 
 
-# -----------------------------
-# Stabilization helpers
-# -----------------------------
 def ema(prev, new, alpha):
     return new if prev is None else (1 - alpha) * prev + alpha * new
 
@@ -84,9 +75,6 @@ def clamp(x, lo, hi):
     return max(lo, min(hi, float(x)))
 
 
-# -----------------------------
-# Warp / remap
-# -----------------------------
 def build_warp_maps(width, height, uCenterX, uPeakY, uGain, sigma_y=0.2):
     x_norm = np.linspace(0.0, 1.0, width, dtype=np.float32)
     y_norm = np.linspace(0.0, 1.0, height, dtype=np.float32)
@@ -112,9 +100,6 @@ def warp_frame(frame_bgr, map_x, map_y):
     )
 
 
-# -----------------------------
-# Pose-derived control signals
-# -----------------------------
 def get_hip_center_and_peakY_from_pose(results, vis_thresh=0.6):
     if not results.pose_landmarks:
         return None, None
@@ -155,9 +140,6 @@ def get_index_y_from_pose(results, vis_thresh=0.6):
     return y_norm
 
 
-# -----------------------------
-# Gesture: hand distance (Pose)
-# -----------------------------
 def get_hand_distance_from_pose(results, vis_thresh=0.6, use_wrist=False):
     if not results.pose_landmarks:
         return None
@@ -182,9 +164,6 @@ def get_hand_distance_from_pose(results, vis_thresh=0.6, use_wrist=False):
     return (dx * dx + dy * dy) ** 0.5
 
 
-# -----------------------------
-# Compositing
-# -----------------------------
 def composite_person_over_bg(person_bgr, seg_mask, bg_bgr=None, thresh=0.5, feather_px=5):
     h, w = person_bgr.shape[:2]
 
@@ -210,9 +189,6 @@ def composite_person_over_bg(person_bgr, seg_mask, bg_bgr=None, thresh=0.5, feat
     return out.astype(np.uint8)
 
 
-# -----------------------------
-# UI helper: transient banner
-# -----------------------------
 def start_banner(text, duration_sec=1.2):
     return {"text": text, "until": time.time() + duration_sec}
 
@@ -251,9 +227,6 @@ def draw_banner(frame_bgr, banner, y):
     cv2.putText(frame_bgr, text, (x, y_text), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -300,9 +273,6 @@ def main():
 
     vis_thresh = 0.6
 
-    # -----------------------------
-    # Incremental uGain control state
-    # -----------------------------
     uGain_live = 0.50
     uGain_min = -0.70
     uGain_max = 2.50
@@ -316,9 +286,6 @@ def main():
     alpha_gain = 0.25
     prev_gain_smoothed = None
 
-    # -----------------------------
-    # Mode gate: idle -> ready -> active
-    # -----------------------------
     mode = "idle"
     prev_mode = mode
 
@@ -357,7 +324,6 @@ def main():
             rgb_for_pose = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pose_results = pose.process(rgb_for_pose)
 
-            # --- Stabilized hips ---
             uCenterX_raw, uPeakY_raw = get_hip_center_and_peakY_from_pose(
                 pose_results, vis_thresh=vis_thresh
             )
@@ -372,7 +338,6 @@ def main():
             uPeakY = ema(prev_peakY, uPeakY_raw, alpha_pose)
             prev_centerX, prev_peakY = uCenterX, uPeakY
 
-            # --- Stabilized index y (kept for compatibility) ---
             index_y_raw = get_index_y_from_pose(pose_results, vis_thresh=vis_thresh)
             if index_y_raw is None:
                 index_y_raw = prev_indexY if prev_indexY is not None else fallback_index_y_norm
@@ -380,7 +345,6 @@ def main():
             index_y_norm = ema(prev_indexY, index_y_raw, alpha_pose)
             prev_indexY = index_y_norm
 
-            # --- Hand distance & mode gate ---
             hand_dist = get_hand_distance_from_pose(
                 pose_results, vis_thresh=vis_thresh, use_wrist=False
             )
@@ -474,9 +438,6 @@ def main():
             )
             final_frame = cv2.resize(prefinal_frame, (1080, 1920))
 
-            # -----------------------------
-            # NEW: Dynamic overlay placement (always "top" of the rotated frame)
-            # -----------------------------
             h, w = final_frame.shape[:2]
 
             banner_y = int(0.12 * h)      # ~12% from top
