@@ -12,9 +12,9 @@ mp_selfie_segmentation = mp.solutions.selfie_segmentation
 # ============================================================
 
 NUM_PERS = 1
-PERSON_IMAGE_PATH = "images_for_warping/pers" + str(NUM_PERS) + ".jpg"
-BACKGROUND_IMAGE_PATH = "images_for_warping/pers" + str(NUM_PERS) + "bg.jpg"
-OUTPUT_PATH = "images_for_warping/pers" + str(NUM_PERS) + "W.png"
+PERSON_IMAGE_PATH = "images_for_warping/pers" + str(NUM_PERS) + ".HEIC"
+BACKGROUND_IMAGE_PATH = "images_for_warping/pers" + str(NUM_PERS) + "bg.HEIC"
+OUTPUT_PATH = "images_for_warping/pers" + str(NUM_PERS) + "W.HEIC"
 
 U_GAIN = 0.30        # Warp strength
 SIGMA_Y = 0.30       # Vertical spread of warp
