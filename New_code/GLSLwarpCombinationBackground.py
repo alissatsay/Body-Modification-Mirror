@@ -6,9 +6,6 @@ mp_pose = mp.solutions.pose
 mp_selfie_segmentation = mp.solutions.selfie_segmentation
 
 
-# -----------------------------
-# Stabilization helpers
-# -----------------------------
 def ema(prev, new, alpha):
     return new if prev is None else (1 - alpha) * prev + alpha * new
 
@@ -18,10 +15,6 @@ def clamp_delta(prev, new, max_step):
         return new
     return max(prev - max_step, min(prev + max_step, new))
 
-
-# -----------------------------
-# Warp / remap
-# -----------------------------
 def build_warp_maps(width, height, uCenterX, uPeakY, uGain, sigma_y=0.2):
     """
     Build remap grids (map_x, map_y) that tell cv2.remap() where to sample
@@ -52,9 +45,6 @@ def warp_frame(frame_bgr, map_x, map_y):
     )
 
 
-# -----------------------------
-# Pose-derived control signals
-# -----------------------------
 def get_hip_center_and_peakY_from_pose(results, vis_thresh=0.6):
     """
     Returns (uCenterX, uPeakY) in [0,1] or (None, None) if not available/reliable.
@@ -105,9 +95,6 @@ def get_index_y_from_pose(results, vis_thresh=0.6):
     return y_norm
 
 
-# -----------------------------
-# Compositing
-# -----------------------------
 def composite_person_over_bg(person_bgr, seg_mask, bg_bgr=None, thresh=0.5, feather_px=5):
     """
     person_bgr : (H,W,3) warped+mirrored person frame
@@ -141,9 +128,6 @@ def composite_person_over_bg(person_bgr, seg_mask, bg_bgr=None, thresh=0.5, feat
     return out.astype(np.uint8)
 
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -207,7 +191,6 @@ def main():
             rgb_for_pose = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pose_results = pose.process(rgb_for_pose)
 
-            # --- Stabilized hips (visibility-gated) ---
             uCenterX_raw, uPeakY_raw = get_hip_center_and_peakY_from_pose(
                 pose_results, vis_thresh=vis_thresh
             )
@@ -226,7 +209,6 @@ def main():
 
             prev_centerX, prev_peakY = uCenterX, uPeakY
 
-            # --- Stabilized index y (visibility-gated) ---
             index_y_raw = get_index_y_from_pose(pose_results, vis_thresh=vis_thresh)
             if index_y_raw is None:
                 index_y_raw = prev_indexY if prev_indexY is not None else fallback_index_y_norm

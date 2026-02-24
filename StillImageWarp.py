@@ -7,10 +7,6 @@ mp_pose = mp.solutions.pose
 mp_selfie_segmentation = mp.solutions.selfie_segmentation
 
 
-# ============================================================
-# GLOBAL CONFIGURATION
-# ============================================================
-
 NUM_PERS = 1
 PERSON_IMAGE_PATH = "images_for_warping/pers" + str(NUM_PERS) + ".HEIC"
 BACKGROUND_IMAGE_PATH = "images_for_warping/pers" + str(NUM_PERS) + "bg.HEIC"
@@ -23,9 +19,6 @@ FEATHER_PX = 5       # Feathering radius
 MIRROR = False       # Selfie-style mirror
 
 
-# ============================================================
-# WARP
-# ============================================================
 
 def build_warp_maps(width, height, uCenterX, uPeakY, uGain, sigma_y=0.2):
     x_norm = np.linspace(0.0, 1.0, width, dtype=np.float32)
@@ -52,9 +45,6 @@ def warp_frame(frame_bgr, map_x, map_y):
     )
 
 
-# ============================================================
-# POSE
-# ============================================================
 
 def get_hip_center_and_peakY_from_pose(results):
     if not results.pose_landmarks:
@@ -73,9 +63,6 @@ def get_hip_center_and_peakY_from_pose(results):
     return uCenterX, uPeakY
 
 
-# ============================================================
-# COMPOSITING
-# ============================================================
 
 def composite_person_over_bg(person_bgr, seg_mask, bg_bgr):
     h, w = person_bgr.shape[:2]
@@ -101,9 +88,6 @@ def composite_person_over_bg(person_bgr, seg_mask, bg_bgr):
     return out.astype(np.uint8)
 
 
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
 
