@@ -44,3 +44,62 @@ def warp_triangle(src_img, dst_img, t_src, t_dst):
     # alpha blend triangle region
     mask3 = np.dstack([mask, mask, mask])
     dst_roi[:] = dst_roi * (1.0 - mask3) + warped_rect * mask3
+
+
+
+def build_grid_mesh(w, h, step=30):
+    xs = np.arange(0, w, step, dtype=np.float32)
+    ys = np.arange(0, h, step, dtype=np.float32)
+    xv, yv = np.meshgrid(xs, ys)
+    V = np.stack([xv.ravel(), yv.ravel()], axis=1)  # (N,2)
+
+    nx = len(xs)
+    ny = len(ys)
+
+    def vid(i, j):
+        return j * nx + i
+
+    tris = []
+    for j in range(ny - 1):
+        for i in range(nx - 1):
+            v00 = vid(i, j)
+            v10 = vid(i + 1, j)
+            v01 = vid(i, j + 1)
+            v11 = vid(i + 1, j + 1)
+            tris.append([v00, v10, v11])
+            tris.append([v00, v11, v01])
+
+    T = np.array(tris, dtype=np.int32)
+    return V, T, nx, ny
+
+def draw_mesh(img_bgr, V, T, color=(0, 255, 0), thickness=1):
+    """
+    img_bgr: (H,W,3) uint8
+    V: (N,2) float32 vertices (x,y)
+    T: (M,3) int32 triangle indices
+    """
+    out = img_bgr.copy()
+    for tri in T:
+        pts = V[tri].astype(np.int32).reshape(-1, 1, 2)  # (3,1,2)
+        cv2.polylines(out, [pts], isClosed=True, color=color, thickness=thickness)
+    return out
+
+def draw_vertices(img_bgr, V, color=(0, 0, 255), r=2):
+    out = img_bgr.copy()
+    for x, y in V:
+        cv2.circle(out, (int(x), int(y)), r, color, -1)
+    return out
+
+def draw_mesh_with_vertices(img_bgr, V, T):
+    out = draw_mesh(img_bgr, V, T, color=(0, 255, 0), thickness=1)
+    out = draw_vertices(out, V, color=(0, 0, 255), r=2)
+    return out
+
+def active_triangles_from_mask(V, T, seg_mask, thresh=0.5):
+    H, W = seg_mask.shape
+    tri_pts = V[T]                      # (M,3,2)
+    centroids = tri_pts.mean(axis=1)    # (M,2)
+    cx = np.clip(centroids[:,0].astype(np.int32), 0, W-1)
+    cy = np.clip(centroids[:,1].astype(np.int32), 0, H-1)
+    active = seg_mask[cy, cx] >= thresh
+    return active
