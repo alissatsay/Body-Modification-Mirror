@@ -7,11 +7,13 @@ def warp_triangle(src_img, dst_img, t_src, t_dst):
     """
     src_img: original BGR image
     dst_img: destination canvas to write into (BGR)
-    t_src, t_dst: (3,2) float32 triangle vertices in (x,y)
+    t_src, t_dst: (3,2) shape array, float32 triangle vertices in (x,y)
     """
     t_src = np.float32(t_src)
     t_dst = np.float32(t_dst)
 
+    # get the smallest axis-aligned rectangles that bound our input triangles
+    # output: (x,y,w,h) tuple for each rectangle, where (x,y) is the top left corner
     r1 = cv2.boundingRect(t_src)
     r2 = cv2.boundingRect(t_dst)
 
