@@ -5,6 +5,7 @@ import numpy as np
 import Triangle_Mesh_helpers
 
 import mediapipe as mp
+#import GLSL_HT_UI
 
 mp_selfie_segmentation = mp.solutions.selfie_segmentation
 
@@ -179,6 +180,7 @@ def test_active_triangles_live(step=40, thresh=0.5, feather=0, show_mask=True):
         print("Error: could not read initial frame.")
         cap.release()
         return
+    #frame = GLSL_HT_UI.rotate_frame(frame)
 
     h, w = frame.shape[:2]
     V, T, nx, ny = Triangle_Mesh_helpers.build_grid_mesh(w, h, step=step)
