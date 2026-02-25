@@ -5,6 +5,7 @@ import numpy as np
 import Triangle_Mesh_helpers
 
 import mediapipe as mp
+import GLSL_HT_UI
 
 mp_selfie_segmentation = mp.solutions.selfie_segmentation
 
@@ -188,6 +189,8 @@ def test_active_triangles_live(step=40, thresh=0.5, feather=0, show_mask=True):
             ok, frame = cap.read()
             if not ok:
                 break
+
+            frame = rotate_frame(frame)
 
             # Keep frame size consistent with the mesh
             if frame.shape[:2] != (h, w):
