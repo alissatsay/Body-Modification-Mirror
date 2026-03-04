@@ -103,3 +103,61 @@ def active_triangles_from_mask(V, T, seg_mask, thresh=0.5):
     cy = np.clip(centroids[:,1].astype(np.int32), 0, H-1)
     active = seg_mask[cy, cx] >= thresh
     return active
+
+def deform_vertices_gaussian(V, cx, cy, gain=25.0, sigma=120.0):
+    V2 = V.copy()
+    dx = V[:,0] - cx
+    dy = V[:,1] - cy
+    w = np.exp(-(dx*dx + dy*dy) / (2*sigma*sigma)).astype(np.float32)
+    # push outwards from center (left goes more left, right goes more right)
+    V2[:,0] += gain * w * np.sign(dx + 1e-6)
+    return V2
+
+def warp_mesh(src_bgr, V, T, V_dst, active):
+    dst = src_bgr.copy()
+    for i, tri in enumerate(T):
+        if not active[i]:
+            continue
+        t_src = V[tri]
+        t_dst = V_dst[tri]
+        warp_triangle(src_bgr, dst, t_src, t_dst)
+    return dst
+
+def vertex_inside_mask(V, seg_mask, thresh=0.5):
+    """Returns boolean array (N,) telling whether each vertex is inside the segmentation mask."""
+    H, W = seg_mask.shape
+    x = np.clip(V[:, 0].astype(np.int32), 0, W - 1)
+    y = np.clip(V[:, 1].astype(np.int32), 0, H - 1)
+    return seg_mask[y, x] >= thresh
+
+def deform_hips_abdomen(V, bbox, gain=40.0, sigma_x=140.0, sigma_y=110.0):
+    """
+    Hip/abdomen-only deformation: push x outward, but only within a vertical band.
+    bbox: (x0,y0,x1,y1) region where deformation is allowed
+    """
+    x0, y0, x1, y1 = bbox
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+
+    V2 = V.copy()
+    dx = V[:, 0] - cx
+    dy = V[:, 1] - cy
+
+    # region gating: only vertices inside bbox get weighted
+    in_box = (V[:, 0] >= x0) & (V[:, 0] <= x1) & (V[:, 1] >= y0) & (V[:, 1] <= y1)
+
+    # elliptical gaussian falloff
+    w = np.exp(-(dx*dx)/(2*sigma_x*sigma_x) - (dy*dy)/(2*sigma_y*sigma_y)).astype(np.float32)
+
+    # widen (left moves left, right moves right) within box
+    V2[in_box, 0] += gain * w[in_box] * np.sign(dx[in_box] + 1e-6)
+    return V2
+
+def draw_active_triangles(img_bgr, V, T, active, color=(0,255,0), thickness=1):
+    out = img_bgr.copy()
+    for i, tri in enumerate(T):
+        if not active[i]:
+            continue
+        pts = V[tri].astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(out, [pts], True, color, thickness)
+    return out
