@@ -1,0 +1,803 @@
+import cv2
+import numpy as np
+import mediapipe as mp
+import time
+from collections import defaultdict, deque
+import time
+import numpy as np
+
+
+ROTATE_DEG = 90                
+ROTATE_DIR = "ccw"              # "ccw" or "cw"
+
+OUTPUT_W = 1080
+OUTPUT_H = 1920
+
+PRIMARY_MONITOR_WIDTH = 1920 
+WINDOW_NAME = "Warped Mirror"
+
+
+OPEN_HAND_REQUIRE_EXTENDED = 4  
+
+IDLE_COLOR = (247, 94, 77)          # BGR
+IDLE_FILL_ALPHA = 0.22
+IDLE_RING_ALPHA = 0.55
+
+ACTIVE_COLOR = (0, 220, 0)          # BGR
+ACTIVE_FILL_ALPHA = 0.18            # translucent green fill
+
+RING_THICKNESS = 6
+PALM_RADIUS_SCALE = 0.85
+RING_START_DEG = -90
+
+mp_pose = mp.solutions.pose
+mp_selfie_segmentation = mp.solutions.selfie_segmentation
+mp_hands = mp.solutions.hands
+
+from collections import Counter
+
+MODE_COUNTS = Counter()
+MODE_TRANSITIONS = Counter()   # keys like ("idle","ready")
+_last_mode = None
+
+
+class RollingStats:
+    def __init__(self, window=300):
+        self.window = window
+        self.data = defaultdict(lambda: deque(maxlen=window))
+
+    def add(self, key, value):
+        self.data[key].append(float(value))
+
+    def pct(self, key, p):
+        arr = np.array(self.data[key], dtype=np.float32)
+        if arr.size == 0:
+            return None
+        return float(np.percentile(arr, p))
+
+    def mean(self, key):
+        arr = np.array(self.data[key], dtype=np.float32)
+        if arr.size == 0:
+            return None
+        return float(arr.mean())
+
+    def count(self, key):
+        return len(self.data[key])
+
+def now_ms():
+    return time.perf_counter() * 1000.0
+
+STATS = RollingStats(window=600)
+_last_report_t = time.perf_counter()
+_report_every_sec = 2.0
+
+def report_stats():
+    # Frame timing
+    p50_ft = STATS.pct("frame_ms", 50)
+    p95_ft = STATS.pct("frame_ms", 95)
+    fps = 1000.0 / p50_ft if p50_ft and p50_ft > 0 else None
+
+    def fmt_ms(k):
+        p50 = STATS.pct(k, 50)
+        p95 = STATS.pct(k, 95)
+        if p50 is None:
+            return f"{k}: n/a"
+        return f"{k}: {p50:.1f}/{p95:.1f}ms"
+
+    # Robustness
+    pose_ok = STATS.mean("pose_ok")  # 0..1
+    hd_ok = STATS.mean("hand_dist_ok")
+    hands_open = STATS.mean("hands_open_ok")
+    fg_ratio = STATS.mean("fg_ratio")
+
+    lines = [
+        f"FPS~{fps:.1f}  frame_ms P50/P95={p50_ft:.1f}/{p95_ft:.1f}",
+        fmt_ms("cap_ms"),
+        fmt_ms("pose_ms"),
+        fmt_ms("hands_ms"),
+        fmt_ms("maps_ms"),
+        fmt_ms("remap_ms"),
+        fmt_ms("seg_ms"),
+        fmt_ms("comp_ms"),
+        fmt_ms("render_ms"),
+        f"pose_ok={pose_ok:.2f} hand_dist_ok={hd_ok:.2f} hands_open_ok={hands_open:.2f} fg_ratio={fg_ratio:.2f}",
+    ]
+    print(" | ".join(lines))
+
+
+def rotate_frame(frame_bgr, deg=ROTATE_DEG, direction=ROTATE_DIR):
+    if frame_bgr is None:
+        return None
+
+    deg = float(deg) % 360.0
+    direction = str(direction).lower().strip()
+    if direction not in ("ccw", "cw"):
+        direction = "ccw"
+
+    ccw_deg = deg if direction == "ccw" else (360.0 - deg) % 360.0
+
+    if abs(ccw_deg - 0.0) < 1e-6:
+        return frame_bgr
+    if abs(ccw_deg - 90.0) < 1e-6:
+        return cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if abs(ccw_deg - 180.0) < 1e-6:
+        return cv2.rotate(frame_bgr, cv2.ROTATE_180)
+    if abs(ccw_deg - 270.0) < 1e-6:
+        return cv2.rotate(frame_bgr, cv2.ROTATE_90_CLOCKWISE)
+
+    h, w = frame_bgr.shape[:2]
+    cx, cy = w / 2.0, h / 2.0
+
+    M = cv2.getRotationMatrix2D((cx, cy), ccw_deg, 1.0)
+
+    cos = abs(M[0, 0])
+    sin = abs(M[0, 1])
+    new_w = int(h * sin + w * cos)
+    new_h = int(h * cos + w * sin)
+
+    M[0, 2] += (new_w / 2.0) - cx
+    M[1, 2] += (new_h / 2.0) - cy
+
+    return cv2.warpAffine(
+        frame_bgr,
+        M,
+        (new_w, new_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+
+
+def ema(prev, new, alpha):
+    return new if prev is None else (1 - alpha) * prev + alpha * new
+
+
+def clamp_delta(prev, new, max_step):
+    if prev is None:
+        return new
+    return max(prev - max_step, min(prev + max_step, new))
+
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, float(x)))
+
+
+def build_warp_maps(width, height, uCenterX, uPeakY, uGain, sigma_y=0.2):
+    x_norm = np.linspace(0.0, 1.0, width, dtype=np.float32)
+    y_norm = np.linspace(0.0, 1.0, height, dtype=np.float32)
+    xv_norm, yv_norm = np.meshgrid(x_norm, y_norm)
+
+    dy = (yv_norm - uPeakY) / max(sigma_y, 1e-6)
+    vertical_profile = np.exp(-(dy ** 2))
+
+    scale = 1.0 + uGain * vertical_profile
+    dx = xv_norm - uCenterX
+    srcx_norm = uCenterX + dx / scale
+
+    map_x = (srcx_norm * (width - 1)).astype(np.float32)
+    map_y = (yv_norm * (height - 1)).astype(np.float32)
+    return map_x, map_y
+
+
+def warp_frame(frame_bgr, map_x, map_y):
+    return cv2.remap(
+        frame_bgr, map_x, map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+
+
+def get_hip_center_and_peakY_from_pose(results, vis_thresh=0.6):
+    if not results.pose_landmarks:
+        return None, None
+
+    lm = results.pose_landmarks.landmark
+    left_hip = lm[mp_pose.PoseLandmark.LEFT_HIP.value]
+    right_hip = lm[mp_pose.PoseLandmark.RIGHT_HIP.value]
+
+    if left_hip.visibility < vis_thresh or right_hip.visibility < vis_thresh:
+        return None, None
+
+    uCenterX = 0.5 * (left_hip.x + right_hip.x)
+    uPeakY = 0.5 * (left_hip.y + right_hip.y) - 0.1
+
+    uCenterX = max(0.0, min(1.0, float(uCenterX)))
+    uPeakY = max(0.0, min(1.0, float(uPeakY)))
+    return uCenterX, uPeakY
+
+
+def get_index_y_from_pose(results, vis_thresh=0.6):
+    if not results.pose_landmarks:
+        return None
+
+    lm = results.pose_landmarks.landmark
+    candidates = []
+
+    for idx in [mp_pose.PoseLandmark.RIGHT_INDEX.value,
+                mp_pose.PoseLandmark.LEFT_INDEX.value]:
+        pt = lm[idx]
+        if pt.visibility >= vis_thresh:
+            candidates.append(pt.y)
+
+    if not candidates:
+        return None
+
+    y_norm = float(min(candidates))
+    y_norm = max(0.0, min(1.0, y_norm))
+    return y_norm
+
+
+def get_hand_distance_from_pose(results, vis_thresh=0.6, use_wrist=False):
+    if not results.pose_landmarks:
+        return None
+
+    lm = results.pose_landmarks.landmark
+
+    if use_wrist:
+        li = mp_pose.PoseLandmark.LEFT_WRIST.value
+        ri = mp_pose.PoseLandmark.RIGHT_WRIST.value
+    else:
+        li = mp_pose.PoseLandmark.LEFT_INDEX.value
+        ri = mp_pose.PoseLandmark.RIGHT_INDEX.value
+
+    L = lm[li]
+    R = lm[ri]
+
+    if L.visibility < vis_thresh or R.visibility < vis_thresh:
+        return None
+
+    dx = float(L.x - R.x)
+    dy = float(L.y - R.y)
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def composite_person_over_bg(person_bgr, seg_mask, bg_bgr=None, thresh=0.5, feather_px=5):
+    h, w = person_bgr.shape[:2]
+
+    if bg_bgr is None:
+        bg_f32 = np.ones_like(person_bgr, dtype=np.float32) * 255.0
+    else:
+        if bg_bgr.shape[:2] != (h, w):
+            bg_bgr = cv2.resize(bg_bgr, (w, h), interpolation=cv2.INTER_LINEAR)
+        bg_f32 = bg_bgr.astype(np.float32)
+
+    person_mask = (seg_mask >= thresh).astype(np.float32)
+
+    if feather_px > 0:
+        k = max(1, int(feather_px))
+        if k % 2 == 0:
+            k += 1
+        person_mask = cv2.GaussianBlur(person_mask, (k, k), 0)
+
+    mask_3 = np.dstack([person_mask] * 3)
+
+    person_f32 = person_bgr.astype(np.float32)
+    out = mask_3 * person_f32 + (1.0 - mask_3) * bg_f32
+    return out.astype(np.uint8)
+
+
+def start_banner(text, duration_sec=1.2):
+    return {"text": text, "until": time.time() + duration_sec}
+
+
+def draw_banner(frame_bgr, banner, y):
+    if banner is None or time.time() > banner["until"]:
+        return
+
+    h, w = frame_bgr.shape[:2]
+    text = banner["text"]
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 1.15
+    thickness = 3
+
+    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+    x = (w - tw) // 2
+    y_text = int(y)
+
+    pad_x, pad_y = 22, 16
+    x1 = x - pad_x
+    y1 = y_text - th - pad_y
+    x2 = x + tw + pad_x
+    y2 = y_text + baseline + pad_y
+
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(w - 1, x2); y2 = min(h - 1, y2)
+
+    cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 0, 0), -1)
+    cv2.putText(frame_bgr, text, (x, y_text), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+
+def count_extended_fingers(hand_lm, handedness_label="Right"):
+    """
+    Returns number of extended fingers in [0..5].
+    Heuristic:
+      - index/middle/ring/pinky: tip.y < pip.y
+      - thumb: right hand tip.x > ip.x ; left hand tip.x < ip.x
+    """
+    THUMB_TIP, THUMB_IP = 4, 3
+    INDEX_TIP, INDEX_PIP = 8, 6
+    MIDDLE_TIP, MIDDLE_PIP = 12, 10
+    RING_TIP, RING_PIP = 16, 14
+    PINKY_TIP, PINKY_PIP = 20, 18
+
+    extended = 0
+
+    if hand_lm.landmark[INDEX_TIP].y < hand_lm.landmark[INDEX_PIP].y:
+        extended += 1
+    if hand_lm.landmark[MIDDLE_TIP].y < hand_lm.landmark[MIDDLE_PIP].y:
+        extended += 1
+    if hand_lm.landmark[RING_TIP].y < hand_lm.landmark[RING_PIP].y:
+        extended += 1
+    if hand_lm.landmark[PINKY_TIP].y < hand_lm.landmark[PINKY_PIP].y:
+        extended += 1
+
+    if handedness_label.lower().startswith("right"):
+        if hand_lm.landmark[THUMB_TIP].x > hand_lm.landmark[THUMB_IP].x:
+            extended += 1
+    else:
+        if hand_lm.landmark[THUMB_TIP].x < hand_lm.landmark[THUMB_IP].x:
+            extended += 1
+
+    return extended
+
+
+def both_hands_open(hands_results, min_extended=4):
+    """
+    True if at least 2 hands detected AND both are "open" (>= min_extended fingers).
+    """
+    if not hands_results.multi_hand_landmarks or not hands_results.multi_handedness:
+        return False
+    if len(hands_results.multi_hand_landmarks) < 2:
+        return False
+
+    ok = 0
+    for hlm, hinfo in zip(hands_results.multi_hand_landmarks, hands_results.multi_handedness):
+        label = hinfo.classification[0].label  # "Left" / "Right"
+        if count_extended_fingers(hlm, label) >= min_extended:
+            ok += 1
+
+    return ok >= 2
+
+
+def _landmark_xy_px(lm, w, h):
+    return int(lm.x * w), int(lm.y * h)
+
+
+def get_palm_circles_from_pose(results, w, h, vis_thresh=0.6):
+    if not results.pose_landmarks:
+        return []
+
+    lm = results.pose_landmarks.landmark
+    circles = []
+
+    hands = [
+        (mp_pose.PoseLandmark.LEFT_WRIST.value,
+         mp_pose.PoseLandmark.LEFT_INDEX.value,
+         mp_pose.PoseLandmark.LEFT_PINKY.value),
+        (mp_pose.PoseLandmark.RIGHT_WRIST.value,
+         mp_pose.PoseLandmark.RIGHT_INDEX.value,
+         mp_pose.PoseLandmark.RIGHT_PINKY.value),
+    ]
+
+    for wi, ii, pi in hands:
+        W = lm[wi]
+        I = lm[ii]
+        P = lm[pi]
+
+        if W.visibility < vis_thresh or I.visibility < vis_thresh or P.visibility < vis_thresh:
+            continue
+
+        wx, wy = _landmark_xy_px(W, w, h)
+        ix, iy = _landmark_xy_px(I, w, h)
+        px, py = _landmark_xy_px(P, w, h)
+
+        cx = int((wx + ix + px) / 3.0)
+        cy = int((wy + iy + py) / 3.0)
+
+        d_wi = ((wx - ix) ** 2 + (wy - iy) ** 2) ** 0.5
+        d_wp = ((wx - px) ** 2 + (wy - py) ** 2) ** 0.5
+        r = int(PALM_RADIUS_SCALE * max(d_wi, d_wp))
+        if r < 8:
+            r = 8
+
+        circles.append((cx, cy, r))
+
+    return circles
+
+
+def draw_palm_ui_to_overlay(overlay_bgr, overlay_alpha, circles,
+                           fill_color_bgr, fill_alpha,
+                           ring_progress=None, ring_alpha=0.0, ring_thickness=6):
+    if not circles:
+        return
+
+    h, w = overlay_alpha.shape[:2]
+
+    if fill_alpha > 0:
+        for (cx, cy, r) in circles:
+            if 0 <= cx < w and 0 <= cy < h:
+                cv2.circle(overlay_bgr, (int(cx), int(cy)), int(r), fill_color_bgr, -1, lineType=cv2.LINE_AA)
+                cv2.circle(overlay_alpha, (int(cx), int(cy)), int(r), float(fill_alpha), -1, lineType=cv2.LINE_AA)
+
+    if ring_progress is not None and ring_alpha > 0 and ring_thickness > 0:
+        p = max(0.0, min(1.0, float(ring_progress)))
+        if p > 0:
+            end_angle = RING_START_DEG + int(360.0 * p)
+            for (cx, cy, r) in circles:
+                if 0 <= cx < w and 0 <= cy < h:
+                    cv2.ellipse(
+                        overlay_bgr, (int(cx), int(cy)), (int(r), int(r)),
+                        0, RING_START_DEG, end_angle,
+                        fill_color_bgr, int(ring_thickness), lineType=cv2.LINE_AA
+                    )
+                    cv2.ellipse(
+                        overlay_alpha, (int(cx), int(cy)), (int(r), int(r)),
+                        0, RING_START_DEG, end_angle,
+                        float(ring_alpha), int(ring_thickness), lineType=cv2.LINE_AA
+                    )
+
+
+def alpha_blend_inplace(dst_bgr, overlay_bgr, overlay_alpha):
+    a = np.clip(overlay_alpha, 0.0, 1.0).astype(np.float32)
+    a3 = np.dstack([a, a, a])
+
+    dst_f = dst_bgr.astype(np.float32)
+    ov_f = overlay_bgr.astype(np.float32)
+
+    out = a3 * ov_f + (1.0 - a3) * dst_f
+    dst_bgr[:] = np.clip(out, 0, 255).astype(np.uint8)
+
+
+def main():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: could not open camera.")
+        return
+
+    ret, frame0 = cap.read()
+    if not ret:
+        print("Error: couldn't read initial frame.")
+        cap.release()
+        return
+
+    frame0 = rotate_frame(frame0)
+    height, width = frame0.shape[:2]
+
+    print("Please move out of the frame. Capturing background in 3 seconds...")
+    cv2.waitKey(3000)
+    ret, captured_bg = cap.read()
+    if ret:
+        captured_bg = rotate_frame(captured_bg)
+        captured_bg = cv2.flip(captured_bg, 1)
+        print("Background captured.")
+    else:
+        captured_bg = None
+        print("Warning: background capture failed. Falling back to white.")
+
+    sigma_y = 0.30
+    fallback_centerX = 0.5
+    fallback_peakY = 0.55
+    fallback_index_y_norm = 0.5
+
+    prev_centerX = None
+    prev_peakY = None
+    prev_indexY = None
+
+    alpha_pose = 0.15
+    max_step_x = 0.03
+    max_step_y = 0.03
+    max_step_idx = 0.05
+
+    vis_thresh = 0.6
+
+    uGain_live = 0.50
+    uGain_min = -0.70
+    uGain_max = 2.50
+
+    prev_hand_dist = None
+
+    gain_sensitivity = 6.0
+    dist_deadzone = 0.005
+    max_gain_step = 0.10
+
+    alpha_gain = 0.25
+    prev_gain_smoothed = None
+
+    mode = "idle"
+
+    stable_required_sec = 2.0
+    stable_eps = 0.006
+    activate_eps = 0.012
+    stop_eps = 0.006
+    stop_hold_sec = 0.40
+
+    stable_start_t = None
+    stop_start_t = None
+
+    banner = start_banner("HOLD YOUR HANDS STILL", duration_sec=2.0)
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.moveWindow(WINDOW_NAME, PRIMARY_MONITOR_WIDTH, 0)
+    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+    with mp_pose.Pose(
+        static_image_mode=False,
+        model_complexity=1,
+        smooth_landmarks=True,
+        enable_segmentation=False,
+        min_detection_confidence=0.6,
+        min_tracking_confidence=0.6
+    ) as pose, mp_selfie_segmentation.SelfieSegmentation(model_selection=1) as segmenter, mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=2,
+        model_complexity=1,
+        min_detection_confidence=0.6,
+        min_tracking_confidence=0.6
+    ) as hands:
+
+        while True:
+            t0 = now_ms()
+
+            # -------------------------
+            # 1) Capture + rotate
+            # -------------------------
+            t = now_ms()
+            ret, frame = cap.read()
+            STATS.add("cap_read_ok", 1.0 if ret else 0.0)
+            if not ret:
+                break
+            frame = rotate_frame(frame)
+            STATS.add("cap_ms", now_ms() - t)
+
+            now = time.time()
+
+            # -------------------------
+            # 2) Pose + Hands (same RGB)
+            # -------------------------
+            t = now_ms()
+            rgb_for_pose = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            STATS.add("cvt_pose_ms", now_ms() - t)
+
+            t = now_ms()
+            pose_results = pose.process(rgb_for_pose)
+            STATS.add("pose_ms", now_ms() - t)
+
+            t = now_ms()
+            hands_results = hands.process(rgb_for_pose)
+            STATS.add("hands_ms", now_ms() - t)
+
+            hands_open_ok = both_hands_open(hands_results, min_extended=OPEN_HAND_REQUIRE_EXTENDED)
+            STATS.add("hands_open_ok", 1.0 if hands_open_ok else 0.0)
+
+            # Pose validity (hips visible)
+            uCenterX_raw, uPeakY_raw = get_hip_center_and_peakY_from_pose(pose_results, vis_thresh=vis_thresh)
+            pose_ok = (uCenterX_raw is not None and uPeakY_raw is not None)
+            STATS.add("pose_ok", 1.0 if pose_ok else 0.0)
+
+            if uCenterX_raw is None or uPeakY_raw is None:
+                uCenterX_raw = prev_centerX if prev_centerX is not None else fallback_centerX
+                uPeakY_raw = prev_peakY if prev_peakY is not None else fallback_peakY
+
+            uCenterX_raw = clamp_delta(prev_centerX, uCenterX_raw, max_step_x)
+            uPeakY_raw = clamp_delta(prev_peakY, uPeakY_raw, max_step_y)
+
+            uCenterX = ema(prev_centerX, uCenterX_raw, alpha_pose)
+            uPeakY = ema(prev_peakY, uPeakY_raw, alpha_pose)
+            prev_centerX, prev_peakY = uCenterX, uPeakY
+
+            # Index Y (for whatever you use it for later)
+            index_y_raw = get_index_y_from_pose(pose_results, vis_thresh=vis_thresh)
+            if index_y_raw is None:
+                index_y_raw = prev_indexY if prev_indexY is not None else fallback_index_y_norm
+            index_y_raw = clamp_delta(prev_indexY, index_y_raw, max_step_idx)
+            prev_indexY = ema(prev_indexY, index_y_raw, alpha_pose)
+
+            # Hand distance derived from pose
+            hand_dist = get_hand_distance_from_pose(pose_results, vis_thresh=vis_thresh, use_wrist=False)
+            STATS.add("hand_dist_ok", 1.0 if (hand_dist is not None) else 0.0)
+
+            move = None
+            d_dist = None
+            if hand_dist is not None and prev_hand_dist is not None:
+                d_dist = float(hand_dist - prev_hand_dist)
+                move = abs(d_dist)
+
+            # -------------------------
+            # 3) Mode machine (idle/ready/active)
+            # -------------------------
+            # Track transitions
+            global _last_mode
+            if _last_mode is None:
+                _last_mode = mode
+            elif mode != _last_mode:
+                MODE_TRANSITIONS[(_last_mode, mode)] += 1
+                _last_mode = mode
+
+            MODE_COUNTS[mode] += 1
+
+            if hand_dist is None:
+                mode = "idle"
+                stable_start_t = None
+                stop_start_t = None
+            else:
+                if mode == "idle":
+                    if hands_open_ok and (move is not None) and (move < stable_eps):
+                        if stable_start_t is None:
+                            stable_start_t = now
+                        elif (now - stable_start_t) >= stable_required_sec:
+                            mode = "ready"
+                            stop_start_t = None
+                    else:
+                        stable_start_t = None
+
+                elif mode == "ready":
+                    if move is not None and move >= activate_eps:
+                        mode = "active"
+                        stop_start_t = None
+
+                elif mode == "active":
+                    if d_dist is not None:
+                        dd = 0.0 if abs(d_dist) < dist_deadzone else d_dist
+                        d_gain = clamp(gain_sensitivity * dd, -max_gain_step, max_gain_step)
+                        uGain_live = clamp(uGain_live + d_gain, uGain_min, uGain_max)
+
+                    if move is not None and move < stop_eps:
+                        if stop_start_t is None:
+                            stop_start_t = now
+                        elif (now - stop_start_t) >= stop_hold_sec:
+                            mode = "idle"
+                            stable_start_t = None
+                            stop_start_t = None
+                    else:
+                        stop_start_t = None
+
+            if hand_dist is not None:
+                prev_hand_dist = hand_dist
+
+            # Smoothed gain actually used for the warp
+            uGain_used = ema(prev_gain_smoothed, uGain_live, alpha_gain)
+            prev_gain_smoothed = uGain_used
+
+            # Control-signal jitter (optional but useful)
+            # store deltas (absolute) to quantify "shaky control"
+            if STATS.count("uGain_used") > 0:
+                pass
+            STATS.add("uGain_used", uGain_used)
+            STATS.add("uCenterX", uCenterX)
+            STATS.add("uPeakY", uPeakY)
+
+            # -------------------------
+            # 4) Background sizing
+            # -------------------------
+            if captured_bg is None:
+                bg = None
+            else:
+                bg = captured_bg
+                if bg.shape[:2] != (height, width):
+                    t = now_ms()
+                    bg = cv2.resize(bg, (width, height), interpolation=cv2.INTER_LINEAR)
+                    STATS.add("bg_resize_ms", now_ms() - t)
+
+            # -------------------------
+            # 5) Build warp maps (this can be expensive)
+            # -------------------------
+            t = now_ms()
+            map_x, map_y = build_warp_maps(width, height, uCenterX, uPeakY, uGain_used, sigma_y)
+            STATS.add("maps_ms", now_ms() - t)
+
+            # -------------------------
+            # 6) Palm UI overlay (pose-based circles) + draw
+            # -------------------------
+            t = now_ms()
+            fh, fw = frame.shape[:2]
+            circles_frame = get_palm_circles_from_pose(pose_results, fw, fh, vis_thresh=vis_thresh)
+
+            ov_bgr = np.zeros_like(frame, dtype=np.uint8)
+            ov_a = np.zeros((fh, fw), dtype=np.float32)
+
+            if mode in ("idle", "ready"):
+                draw_palm_ui_to_overlay(ov_bgr, ov_a, circles_frame, IDLE_COLOR, IDLE_FILL_ALPHA)
+                if mode == "idle" and stable_start_t is not None and hands_open_ok:
+                    charge_progress = clamp((now - stable_start_t) / max(stable_required_sec, 1e-6), 0.0, 1.0)
+                    draw_palm_ui_to_overlay(
+                        ov_bgr, ov_a, circles_frame,
+                        fill_color_bgr=IDLE_COLOR,
+                        fill_alpha=0.0,
+                        ring_progress=charge_progress,
+                        ring_alpha=IDLE_RING_ALPHA,
+                        ring_thickness=RING_THICKNESS
+                    )
+            elif mode == "active":
+                draw_palm_ui_to_overlay(ov_bgr, ov_a, circles_frame, ACTIVE_COLOR, ACTIVE_FILL_ALPHA)
+
+            STATS.add("ui_ms", now_ms() - t)
+
+            # -------------------------
+            # 7) Remap (warp) + flip
+            # -------------------------
+            t = now_ms()
+            warped = warp_frame(frame, map_x, map_y)
+            ov_bgr_warp = warp_frame(ov_bgr, map_x, map_y)
+            ov_a_warp = cv2.remap(
+                ov_a, map_x, map_y,
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0
+            )
+            STATS.add("remap_ms", now_ms() - t)
+
+            t = now_ms()
+            mirrored = cv2.flip(warped, 1)
+            ov_bgr_warp = cv2.flip(ov_bgr_warp, 1)
+            ov_a_warp = cv2.flip(ov_a_warp, 1)
+            STATS.add("flip_ms", now_ms() - t)
+
+            # -------------------------
+            # 8) Segmentation
+            # -------------------------
+            t = now_ms()
+            rgb_for_seg = cv2.cvtColor(mirrored, cv2.COLOR_BGR2RGB)
+            seg_results = segmenter.process(rgb_for_seg)
+            seg_mask = seg_results.segmentation_mask
+            STATS.add("seg_ms", now_ms() - t)
+
+            # Seg health: foreground ratio at threshold
+            if seg_mask is not None:
+                STATS.add("fg_ratio", float((seg_mask >= 0.5).mean()))
+            else:
+                STATS.add("fg_ratio", 0.0)
+
+            # -------------------------
+            # 9) Composite + overlay blend + resize
+            # -------------------------
+            t = now_ms()
+            prefinal_frame = composite_person_over_bg(mirrored, seg_mask, bg_bgr=bg, thresh=0.5, feather_px=5)
+            alpha_blend_inplace(prefinal_frame, ov_bgr_warp, ov_a_warp)
+            final_frame = cv2.resize(prefinal_frame, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
+            STATS.add("comp_ms", now_ms() - t)
+
+            # -------------------------
+            # 10) Banner + render
+            # -------------------------
+            t = now_ms()
+            banner_y = int(0.10 * final_frame.shape[0])
+            draw_banner(final_frame, banner, y=banner_y)
+            cv2.imshow(WINDOW_NAME, final_frame)
+            key = cv2.waitKey(1) & 0xFF
+            STATS.add("render_ms", now_ms() - t)
+
+            # -------------------------
+            # 11) Whole-frame timing
+            # -------------------------
+            STATS.add("frame_ms", now_ms() - t0)
+
+            # Periodic report
+            global _last_report_t
+            if time.perf_counter() - _last_report_t >= _report_every_sec:
+                # add mode stats snapshot
+                total = sum(MODE_COUNTS.values()) or 1
+                idle_pct = MODE_COUNTS["idle"] / total
+                ready_pct = MODE_COUNTS["ready"] / total
+                active_pct = MODE_COUNTS["active"] / total
+                print(f"mode% idle={idle_pct:.2f} ready={ready_pct:.2f} active={active_pct:.2f} "
+                    f"transitions={dict(MODE_TRANSITIONS)}")
+                report_stats()
+                _last_report_t = time.perf_counter()
+
+            # Keys
+            if key == ord('q'):
+                break
+            if key == ord('r'):
+                uGain_live = 0.50
+                prev_gain_smoothed = None
+                mode = "idle"
+                stable_start_t = None
+                stop_start_t = None
+                banner = start_banner("HOLD YOUR HANDS STILL", duration_sec=1.6)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
