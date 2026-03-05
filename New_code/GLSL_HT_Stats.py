@@ -250,7 +250,7 @@ def get_hand_distance_from_pose(results, vis_thresh=0.6, use_wrist=False):
     return (dx * dx + dy * dy) ** 0.5
 
 
-def composite_person_over_bg(person_bgr, seg_mask, bg_bgr=None, thresh=0.5, feather_px=5):
+def composite_person_over_bg(person_bgr, seg_mask, bg_bgr=None, thresh=0.5, feather_px=3):
     h, w = person_bgr.shape[:2]
 
     if bg_bgr is None:
