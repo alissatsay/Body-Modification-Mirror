@@ -23,7 +23,7 @@ SEG_THRESH = 0.5     # Segmentation threshold
 FEATHER_PX = 5       # Feathering radius
 MIRROR = True       # Selfie-style mirror
 
-UGAINS = [0.0, 0.5, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]
+UGAINS = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]
 
 CAPTURE_DELAY_SEC = 5
 CAMERA_INDEX = 0     # change to 1 if you have multiple cameras
