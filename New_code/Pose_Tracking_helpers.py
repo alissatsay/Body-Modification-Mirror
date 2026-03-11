@@ -68,3 +68,104 @@ def _pose_band_from_landmarks(landmarks, w, h,
         return None
 
     return (x0, y0, x1, y1), (hip_mid_x, hip_mid_y), (shoulder_mid_x, shoulder_mid_y), torso_mid_y
+
+def _is_open_palm(hand_landmarks, handedness_label=None, require_extended=4):
+    """
+    Simple open-palm test:
+    - index/middle/ring/pinky count as extended if tip is above pip in image coords
+    - thumb is checked with a simple x-direction heuristic
+    Returns (is_open, num_extended)
+    """
+    lm = hand_landmarks.landmark
+
+    # Finger landmark indices
+    tips = [8, 12, 16, 20]
+    pips = [6, 10, 14, 18]
+
+    extended = 0
+
+    # For the 4 fingers: in image coordinates, smaller y means "higher"
+    for tip_idx, pip_idx in zip(tips, pips):
+        if lm[tip_idx].y < lm[pip_idx].y:
+            extended += 1
+
+    # Optional thumb check, not required for open palm by default
+    thumb_extended = False
+    if handedness_label == "Right":
+        thumb_extended = lm[4].x < lm[3].x
+    elif handedness_label == "Left":
+        thumb_extended = lm[4].x > lm[3].x
+
+    is_open = extended >= require_extended
+    return is_open, extended + int(thumb_extended)
+
+def _hand_center_px(hand_landmarks, w, h):
+    """
+    Robust-ish palm center:
+    average of wrist + MCP joints of index/middle/ring/pinky.
+    """
+    lm = hand_landmarks.landmark
+    ids = [0, 5, 9, 13, 17]  # wrist + finger MCPs
+    xs = [lm[i].x * w for i in ids]
+    ys = [lm[i].y * h for i in ids]
+    cx = int(np.mean(xs))
+    cy = int(np.mean(ys))
+    return cx, cy
+
+def get_segmentation_mask(frame_bgr, segmenter, feather=0):
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    seg = segmenter.process(rgb)
+    seg_mask = seg.segmentation_mask.astype(np.float32)
+
+    if feather and feather > 0:
+        k = int(feather)
+        if k % 2 == 0:
+            k += 1
+        seg_mask = cv2.GaussianBlur(seg_mask, (k, k), 0)
+
+    return seg_mask, rgb
+
+def get_hand_state(rgb, hands, seg_mask, thresh, w, h):
+    hand_results = hands.process(rgb)
+
+    state = {
+        "detected": False,
+        "center": None,
+        "is_open": False,
+        "is_fist": False,
+        "over_body": False,
+        "extended_count": 0,
+    }
+
+    if not hand_results.multi_hand_landmarks:
+        return state
+
+    hand_landmarks = hand_results.multi_hand_landmarks[0]
+
+    handedness_label = None
+    if hand_results.multi_handedness:
+        handedness_label = hand_results.multi_handedness[0].classification[0].label
+
+    is_open, n_extended = _is_open_palm(
+        hand_landmarks,
+        handedness_label=handedness_label,
+        require_extended=4
+    )
+
+    cx, cy = _hand_center_px(hand_landmarks, w, h)
+
+    over_body = False
+    if 0 <= cx < w and 0 <= cy < h:
+        over_body = seg_mask[cy, cx] >= thresh
+
+    is_fist = (not is_open) and (n_extended <= 1)
+
+    state.update({
+        "detected": True,
+        "center": (cx, cy),
+        "is_open": is_open,
+        "is_fist": is_fist,
+        "over_body": over_body,
+        "extended_count": n_extended,
+    })
+    return state

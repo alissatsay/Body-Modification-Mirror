@@ -2,10 +2,12 @@
 
 import cv2
 import numpy as np
-import Triangle_Mesh_helpers
+import Triangle_Mesh_helpers as TMh
 import Pose_Tracking_helpers as PTh
 
 import mediapipe as mp
+mp_selfie_segmentation = mp.solutions.selfie_segmentation
+mp_hands = mp.solutions.hands
 #import GLSL_HT_UI
 
 mp_selfie_segmentation = mp.solutions.selfie_segmentation
@@ -47,7 +49,7 @@ def test_warp_triangle():
     cv2.polylines(dst_img, [np.int32(t_dst)], True, (0,0,255), 2)
 
     # Apply warp
-    Triangle_Mesh_helpers.warp_triangle(src_img, dst_img, t_src, t_dst)
+    TMh.warp_triangle(src_img, dst_img, t_src, t_dst)
 
     # Show result
     combined = np.hstack([src_img, dst_img])
@@ -115,7 +117,7 @@ def interactive_triangle_test():
 
         dst_img = src_img.copy()
 
-        Triangle_Mesh_helpers.warp_triangle(
+        TMh.warp_triangle(
             src_img,
             dst_img,
             t_src,
@@ -148,9 +150,9 @@ def make_draw_mesh_test():
     img = np.zeros((h, w, 3), dtype=np.uint8)
 
     # Build mesh
-    V, T, nx, ny = Triangle_Mesh_helpers.build_grid_mesh(w, h, step=40)
+    V, T, nx, ny = TMh.build_grid_mesh(w, h, step=40)
 
-    vis = Triangle_Mesh_helpers.draw_mesh_with_vertices(img, V, T)
+    vis = TMh.draw_mesh_with_vertices(img, V, T)
     cv2.imshow("mesh+verts", vis)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
@@ -185,7 +187,7 @@ def test_active_triangles_live(step=40, thresh=0.5, feather=0, show_mask=True):
     #frame = GLSL_HT_UI.rotate_frame(frame)
 
     h, w = frame.shape[:2]
-    V, T, nx, ny = Triangle_Mesh_helpers.build_grid_mesh(w, h, step=step)
+    V, T, nx, ny = TMh.build_grid_mesh(w, h, step=step)
 
     with mp_selfie_segmentation.SelfieSegmentation(model_selection=1) as segmenter:
         while True:
@@ -208,7 +210,7 @@ def test_active_triangles_live(step=40, thresh=0.5, feather=0, show_mask=True):
                     k += 1
                 seg_mask = cv2.GaussianBlur(seg_mask, (k, k), 0)
 
-            active = Triangle_Mesh_helpers.active_triangles_from_mask(V, T, seg_mask, thresh=thresh)
+            active = TMh.active_triangles_from_mask(V, T, seg_mask, thresh=thresh)
 
             vis = draw_active_triangles(frame, V, T, active, color=(0, 255, 0), thickness=1)
 
@@ -253,10 +255,10 @@ def test_active_triangles_live(step=40, thresh=0.5, feather=0, show_mask=True):
             # Adjust mesh density
             elif key in (ord('+'), ord('=')):
                 step = max(10, step - 5)  # smaller step => denser mesh
-                V, T, nx, ny = Triangle_Mesh_helpers.build_grid_mesh(w, h, step=step)
+                V, T, nx, ny = TMh.build_grid_mesh(w, h, step=step)
             elif key in (ord('-'), ord('_')):
                 step = min(150, step + 5)  # larger step => coarser mesh
-                V, T, nx, ny = Triangle_Mesh_helpers.build_grid_mesh(w, h, step=step)
+                V, T, nx, ny = TMh.build_grid_mesh(w, h, step=step)
 
             # Toggle feather
             elif key == ord('f'):
@@ -265,15 +267,15 @@ def test_active_triangles_live(step=40, thresh=0.5, feather=0, show_mask=True):
     cap.release()
     cv2.destroyAllWindows()
 
-
-
-def test_mesh_warp_hips_live(step=40, thresh=0.5, feather=9, show_mask=True):
+def test_hand_brush_triangles_live(step=40, thresh=0.5, feather=0, show_mask=True):
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: could not open camera.")
         return
-    print("Camera found")
+    else:
+        print("Camera found")
 
+    # Read one frame to fix mesh dimensions
     ok, frame = cap.read()
     if not ok:
         print("Error: could not read initial frame.")
@@ -281,22 +283,19 @@ def test_mesh_warp_hips_live(step=40, thresh=0.5, feather=9, show_mask=True):
         return
 
     h, w = frame.shape[:2]
-    V, T, nx, ny = Triangle_Mesh_helpers.build_grid_mesh(w, h, step=step)
+    V, T, nx, ny = TMh.build_grid_mesh(w, h, step=step)
 
-    # Defaults (used if pose fails)
-    band_top = 0.45
-    band_bot = 0.85
-    band_half_width = 0.22
-    gain = 22.0
-
-    # Pose-tied tuning knobs
-    top_frac_of_torso = 0.10   # band starts a bit below torso midpoint
-    bot_frac_of_torso = 0.85   # down toward upper thighs
-    band_half_width_frac = 0.22
+    # Brush radius chosen automatically from frame size
+    brush_radius = max(45, int(min(w, h) * 0.08))
 
     with mp_selfie_segmentation.SelfieSegmentation(model_selection=1) as segmenter, \
-         mp_pose.Pose(model_complexity=1, enable_segmentation=False,
-                      min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+         mp_hands.Hands(
+             static_image_mode=False,
+             max_num_hands=1,
+             model_complexity=1,
+             min_detection_confidence=0.5,
+             min_tracking_confidence=0.5,
+         ) as hands:
 
         while True:
             ok, frame = cap.read()
@@ -306,86 +305,131 @@ def test_mesh_warp_hips_live(step=40, thresh=0.5, feather=9, show_mask=True):
             if frame.shape[:2] != (h, w):
                 frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
 
+            # Mirror for more natural interaction
+            frame = cv2.flip(frame, 1)
+
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Segmentation
+            # --- Person segmentation ---
             seg = segmenter.process(rgb)
-            seg_mask = seg.segmentation_mask  # float32 [0,1], shape (h,w)
+            seg_mask = seg.segmentation_mask.astype(np.float32)  # (h, w) in [0,1]
+
             if feather and feather > 0:
                 k = int(feather)
                 if k % 2 == 0:
                     k += 1
                 seg_mask = cv2.GaussianBlur(seg_mask, (k, k), 0)
 
-            # Pose (for person-centric band)
-            pose_res = pose.process(rgb)
-            bbox = None
-            hip_mid = shoulder_mid = torso_mid_y = None
-            if pose_res.pose_landmarks:
-                out = PTh._pose_band_from_landmarks(
-                    pose_res.pose_landmarks.landmark, w, h,
-                    band_half_width_frac=band_half_width_frac,
-                    top_frac_of_torso=top_frac_of_torso,
-                    bot_frac_of_torso=bot_frac_of_torso
+            # Active body triangles
+            active = TMh.active_triangles_from_mask(V, T, seg_mask, thresh=thresh)
+
+            # --- Hand detection ---
+            hand_results = hands.process(rgb)
+
+            hand_center = None
+            hand_is_open = False
+            hand_over_body = False
+            affected_vertices = np.zeros(len(V), dtype=bool)
+            affected_triangles = np.zeros(len(T), dtype=bool)
+
+            if hand_results.multi_hand_landmarks:
+                hand_landmarks = hand_results.multi_hand_landmarks[0]
+
+                handedness_label = None
+                if hand_results.multi_handedness:
+                    handedness_label = hand_results.multi_handedness[0].classification[0].label
+
+                hand_is_open, _ = PTh._is_open_palm(
+                    hand_landmarks,
+                    handedness_label=handedness_label,
+                    require_extended=4
                 )
-                if out is not None:
-                    bbox, hip_mid, shoulder_mid, torso_mid_y = out
 
-            # Fallback if pose is missing/unreliable
-            if bbox is None:
-                cx = w * 0.5
-                x0 = int(cx - band_half_width * w)
-                x1 = int(cx + band_half_width * w)
-                y0 = int(band_top * h)
-                y1 = int(band_bot * h)
-                bbox = (x0, y0, x1, y1)
+                cx, cy = PTh._hand_center_px(hand_landmarks, w, h)
+                hand_center = (cx, cy)
 
-            # Active triangles: centroid inside body
-            active = Triangle_Mesh_helpers.active_triangles_from_mask(V, T, seg_mask, thresh=thresh)
+                # Only consider the brush "active" if the palm center is over the segmented body
+                if 0 <= cx < w and 0 <= cy < h:
+                    hand_over_body = seg_mask[cy, cx] >= thresh
 
-            # Deform vertices in the band
-            V_dst = Triangle_Mesh_helpers.deform_hips_abdomen(V, bbox=bbox, gain=gain)
+                # Find vertices inside brush radius
+                if hand_is_open and hand_over_body:
+                    d2 = (V[:, 0] - cx) ** 2 + (V[:, 1] - cy) ** 2
+                    affected_vertices = d2 <= (brush_radius ** 2)
 
-            # Freeze vertices outside mask
-            inside = Triangle_Mesh_helpers.vertex_inside_mask(V, seg_mask, thresh=thresh)
-            V_dst[~inside] = V[~inside]
+                    # A triangle is affected if:
+                    # - it is active
+                    # - and at least one of its vertices lies in the brush radius
+                    affected_triangles = active & np.any(affected_vertices[T], axis=1)
 
-            # Warp mesh
-            warped = Triangle_Mesh_helpers.warp_mesh(frame, V, T, V_dst, active)
+            # --- Draw overlays ---
+            vis = TMh._draw_triangle_overlay(
+                frame=frame,
+                V=V,
+                T=T,
+                active_mask=active,
+                affected_mask=affected_triangles,
+                pale_color=(0, 255, 0),
+                bright_color=(0, 255, 0),
+                pale_alpha=0.12,
+                bright_alpha=0.42,
+                line_thickness=1,
+            )
 
-            # Composite body region
-            mask = (seg_mask >= thresh).astype(np.float32)
-            mask3 = np.dstack([mask, mask, mask])
-            out = (frame * (1.0 - mask3) + warped * mask3).astype(np.uint8)
+            # Draw affected vertices
+            if np.any(affected_vertices):
+                pts = np.round(V[affected_vertices]).astype(np.int32)
+                for x, y in pts:
+                    cv2.circle(vis, (x, y), 3, (0, 255, 0), -1, lineType=cv2.LINE_AA)
 
-            # Debug overlays
-            vis = out.copy()
-            vis = draw_active_triangles(vis, V_dst, T, active, color=(0, 255, 0), thickness=1)
+            # Draw brush circle
+            if hand_center is not None:
+                cx, cy = hand_center
+                brush_color = (0, 255, 0) if (hand_is_open and hand_over_body) else (180, 180, 180)
+                cv2.circle(vis, (cx, cy), brush_radius, brush_color, 2, lineType=cv2.LINE_AA)
+                cv2.circle(vis, (cx, cy), 4, brush_color, -1, lineType=cv2.LINE_AA)
 
-            x0, y0, x1, y1 = bbox
-            # cv2.rectangle(vis, (x0, y0), (x1, y1), (255, 255, 255), 2)
+                status = "OPEN PALM" if hand_is_open else "hand detected"
+                if hand_is_open and not hand_over_body:
+                    status += " (not over body)"
+                cv2.putText(
+                    vis,
+                    status,
+                    (cx + 12, max(20, cy - 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    brush_color,
+                    2,
+                    cv2.LINE_AA
+                )
 
-            # if hip_mid is not None:
-            #     cv2.circle(vis, (int(hip_mid[0]), int(hip_mid[1])), 5, (255, 255, 255), -1)
-            # if shoulder_mid is not None:
-            #     cv2.circle(vis, (int(shoulder_mid[0]), int(shoulder_mid[1])), 5, (255, 255, 255), -1)
-            # if torso_mid_y is not None:
-            #     cv2.line(vis, (0, int(torso_mid_y)), (w - 1, int(torso_mid_y)), (255, 255, 255), 1)
-
+            # Debug text
             cv2.putText(
                 vis,
-                f"active: {int(active.sum())}/{len(T)}  step={step}  thresh={thresh:.2f}  gain={gain:.1f}",
-                (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255,255,255), 2, cv2.LINE_AA
+                f"active: {int(active.sum())}/{len(T)}   affected: {int(affected_triangles.sum())}   step={step}   thresh={thresh:.2f}   feather={feather}",
+                (12, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA
             )
             cv2.putText(
                 vis,
-                "q quit | [ ] thresh | - + mesh | g/G gain | f feather | i/k topFrac | o/l botFrac | w/W widthFrac",
-                (12, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA
+                "q quit | [ ] thresh | - + step | f toggle feather",
+                (12, 56),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA
             )
 
-            cv2.imshow("Mesh warp (hips/abdomen, pose-tied)", vis)
+            cv2.imshow("Hand brush over active triangles", vis)
+
             if show_mask:
-                cv2.imshow("Segmentation mask", (seg_mask * 255).astype(np.uint8))
+                mask_vis = (seg_mask * 255).astype(np.uint8)
+                cv2.imshow("Segmentation mask", mask_vis)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
@@ -399,44 +443,85 @@ def test_mesh_warp_hips_live(step=40, thresh=0.5, feather=9, show_mask=True):
 
             # Adjust mesh density
             elif key in (ord('+'), ord('=')):
-                step = max(10, step - 5)
-                V, T, nx, ny = Triangle_Mesh_helpers.build_grid_mesh(w, h, step=step)
+                step = max(10, step - 5)   # smaller step => denser mesh
+                V, T, nx, ny = TMh.build_grid_mesh(w, h, step=step)
             elif key in (ord('-'), ord('_')):
-                step = min(150, step + 5)
-                V, T, nx, ny = Triangle_Mesh_helpers.build_grid_mesh(w, h, step=step)
+                step = min(150, step + 5)  # larger step => coarser mesh
+                V, T, nx, ny = TMh.build_grid_mesh(w, h, step=step)
 
             # Toggle feather
             elif key == ord('f'):
                 feather = 0 if feather else 9
 
-            # Adjust gain
-            elif key == ord('g'):
-                gain = max(0.0, gain - 2.0)
-            elif key == ord('G'):
-                gain = min(80.0, gain + 2.0)
+    cap.release()
+    cv2.destroyAllWindows()
 
-            # Pose band tuning (relative to torso)
-            elif key == ord('i'):
-                top_frac_of_torso = max(-0.5, top_frac_of_torso - 0.05)
-            elif key == ord('k'):
-                top_frac_of_torso = min(bot_frac_of_torso - 0.05, top_frac_of_torso + 0.05)
-            elif key == ord('o'):
-                bot_frac_of_torso = max(top_frac_of_torso + 0.05, bot_frac_of_torso - 0.05)
-            elif key == ord('l'):
-                bot_frac_of_torso = min(1.5, bot_frac_of_torso + 0.05)
+def test_hand_brush_drag_live(step=40, thresh=0.5, feather=0, show_mask=True):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: could not open camera.")
+        return
+    else:
+        print("Camera found")
 
-            # Band width
-            elif key == ord('w'):
-                band_half_width_frac = max(0.05, band_half_width_frac - 0.02)
-            elif key == ord('W'):
-                band_half_width_frac = min(0.48, band_half_width_frac + 0.02)
+    ok, frame = cap.read()
+    if not ok:
+        print("Error: could not read initial frame.")
+        cap.release()
+        return
+
+    h, w = frame.shape[:2]
+
+    V_base, T, nx, ny = TMh.build_grid_mesh(w, h, step=step)
+    V_def = V_base.copy().astype(np.float32)
+
+    brush_radius = max(45, int(min(w, h) * 0.08))
+
+    interaction_state = {
+        "preview_vertices": np.zeros(len(V_def), dtype=bool),
+        "preview_triangles": np.zeros(len(T), dtype=bool),
+        "drag_vertices": np.zeros(len(V_def), dtype=bool),
+        "drag_triangles": np.zeros(len(T), dtype=bool),
+        "dragging": False,
+        "prev_hand_center": None,
+        "hand_was_open": False,
+    }
+
+    with mp_selfie_segmentation.SelfieSegmentation(model_selection=1) as segmenter, \
+         mp_hands.Hands(
+             static_image_mode=False,
+             max_num_hands=1,
+             model_complexity=1,
+             min_detection_confidence=0.5,
+             min_tracking_confidence=0.5,
+         ) as hands:
+
+        TMh.run_hand_brush_drag_loop(
+            cap=cap,
+            segmenter=segmenter,
+            hands=hands,
+            h=h,
+            w=w,
+            V_base=V_base,
+            V_def=V_def,
+            T=T,
+            step=step,
+            thresh=thresh,
+            feather=feather,
+            show_mask=show_mask,
+            brush_radius=brush_radius,
+            interaction_state=interaction_state,
+        )
 
     cap.release()
     cv2.destroyAllWindows()
 
 
+
+
 #Stest_warp_triangle()
-interactive_triangle_test()
+# interactive_triangle_test()
 # make_draw_mesh_test()
 # test_active_triangles_live()
-# test_mesh_warp_hips_live(step=40, thresh=0.5, feather=9, show_mask=True)
+# test_hand_brush_triangles_live(step=40, thresh=0.5, feather=0, show_mask=True)
+test_hand_brush_drag_live(step=40, thresh=0.5, feather=0, show_mask=True)
