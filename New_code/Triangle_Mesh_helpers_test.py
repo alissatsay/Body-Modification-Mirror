@@ -5,6 +5,7 @@ import numpy as np
 import Triangle_Mesh_helpers as TMh
 import Pose_Tracking_helpers as PTh
 import Loop_helpers as Lh
+import Display_helpres as Dh
 
 import mediapipe as mp
 mp_selfie_segmentation = mp.solutions.selfie_segmentation
@@ -657,6 +658,97 @@ def test_hand_brush_drag_live(step=40, thresh=0.5, feather=0, show_mask=False):
     cap.release()
     cv2.destroyAllWindows()
 
+def test_hand_brush_drag_arap_live_rotated(
+    step=40,
+    thresh=0.5,
+    feather=0,
+    show_mask=False,
+    rotate_deg=90,
+    rotate_dir="ccw",
+    primary_monitor_width=1920,
+    window_name="Hand brush drag on mesh",
+):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: could not open camera.")
+        return
+    else:
+        print("Camera found")
+
+    ok, frame = cap.read()
+    if not ok:
+        print("Error: could not read initial frame.")
+        cap.release()
+        return
+
+    h, w = frame.shape[:2]
+
+    V_base, T, nx, ny = TMh.build_grid_mesh(w, h, step=step)
+    V_def = V_base.copy().astype(np.float32)
+
+    offset_local = np.zeros_like(V_base, dtype=np.float32)
+
+    E = TMh.build_unique_edges(T)
+    neighbors = TMh.build_vertex_neighbors(len(V_base), E)
+    arap_cache = {
+        "E": E,
+        "neighbors": neighbors,
+    }
+
+    brush_radius = max(45, int(min(w, h) * 0.08))
+
+    interaction_state = {
+        "preview_vertices": np.zeros(len(V_def), dtype=bool),
+        "preview_triangles": np.zeros(len(T), dtype=bool),
+        "drag_vertices": np.zeros(len(V_def), dtype=bool),
+        "drag_triangles": np.zeros(len(T), dtype=bool),
+        "dragging": False,
+        "prev_hand_center": None,
+        "hand_was_open": False,
+        "ref_body_box": None,
+    }
+
+    Dh.setup_fullscreen_second_monitor_window(
+        window_name=window_name,
+        primary_monitor_width=primary_monitor_width,
+        y=0,
+    )
+
+    with mp_selfie_segmentation.SelfieSegmentation(model_selection=1) as segmenter, \
+         mp_hands.Hands(
+             static_image_mode=False,
+             max_num_hands=1,
+             model_complexity=1,
+             min_detection_confidence=0.5,
+             min_tracking_confidence=0.5,
+         ) as hands:
+
+        Lh.run_hand_brush_drag_arap_loop_rotated(
+            cap=cap,
+            segmenter=segmenter,
+            hands=hands,
+            h=h,
+            w=w,
+            V_base=V_base,
+            V_def=V_def,
+            T=T,
+            step=step,
+            thresh=thresh,
+            feather=feather,
+            show_mask=show_mask,
+            brush_radius=brush_radius,
+            interaction_state=interaction_state,
+            offset_local=offset_local,
+            arap_cache=arap_cache,
+            rotate_deg=rotate_deg,
+            rotate_dir=rotate_dir,
+            window_name=window_name,
+        )
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
 def test_hand_brush_drag_arap_live(step=40, thresh=0.5, feather=0, show_mask=False):
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -686,7 +778,7 @@ def test_hand_brush_drag_arap_live(step=40, thresh=0.5, feather=0, show_mask=Fal
         "neighbors": neighbors,
     }
 
-    brush_radius = max(45, int(min(w, h) * 0.08))
+    brush_radius = max(45, int(min(w, h) * 0.2))
 
     interaction_state = {
         "preview_vertices": np.zeros(len(V_def), dtype=bool),
@@ -698,6 +790,10 @@ def test_hand_brush_drag_arap_live(step=40, thresh=0.5, feather=0, show_mask=Fal
         "hand_was_open": False,
         "ref_body_box": None,
     }
+
+    # simple window (main monitor, no movement)
+    window_name = "Hand brush drag on mesh"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     with mp_selfie_segmentation.SelfieSegmentation(model_selection=1) as segmenter, \
          mp_hands.Hands(
@@ -725,10 +821,12 @@ def test_hand_brush_drag_arap_live(step=40, thresh=0.5, feather=0, show_mask=Fal
             interaction_state=interaction_state,
             offset_local=offset_local,
             arap_cache=arap_cache,
+            window_name=window_name,  # make sure loop uses this
         )
 
     cap.release()
     cv2.destroyAllWindows()
+
 
 
 
@@ -743,3 +841,13 @@ def test_hand_brush_drag_arap_live(step=40, thresh=0.5, feather=0, show_mask=Fal
 # test_hand_brush_drag_live_pose(step=40, thresh=0.5, feather=0, show_mask=False)
 # test_hand_brush_drag_live(step=40, thresh=0.5, feather=0, show_mask=False)
 test_hand_brush_drag_arap_live(step=40, thresh=0.5, feather=0, show_mask=False)
+# test_hand_brush_drag_arap_live_rotated(
+#     step=40,
+#     thresh=0.5,
+#     feather=0,
+#     show_mask=False,
+#     rotate_deg=90,
+#     rotate_dir="cw",
+#     primary_monitor_width=1920,
+#     window_name="Hand brush drag on mesh",
+# )
