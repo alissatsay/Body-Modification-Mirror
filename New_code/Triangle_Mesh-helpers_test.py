@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 import Triangle_Mesh_helpers as TMh
 import Pose_Tracking_helpers as PTh
+import Loop_helpers as Lh
 
 import mediapipe as mp
 mp_selfie_segmentation = mp.solutions.selfie_segmentation
@@ -516,6 +517,220 @@ def test_hand_brush_drag_live(step=40, thresh=0.5, feather=0, show_mask=True):
     cap.release()
     cv2.destroyAllWindows()
 
+def test_hand_brush_drag_live_pose(step=40, thresh=0.5, feather=0, show_mask=False):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: could not open camera.")
+        return
+    else:
+        print("Camera found")
+
+    ok, frame = cap.read()
+    if not ok:
+        print("Error: could not read initial frame.")
+        cap.release()
+        return
+
+    h, w = frame.shape[:2]
+
+    # FULL-frame mesh
+    V_base, T, nx, ny = TMh.build_grid_mesh(w, h, step=step)
+    V_def = V_base.copy().astype(np.float32)
+
+    # persistent offsets in normalized body coordinates
+    offset_local = np.zeros_like(V_base, dtype=np.float32)
+
+    brush_radius = max(45, int(min(w, h) * 0.08))
+
+    interaction_state = {
+        "preview_vertices": np.zeros(len(V_def), dtype=bool),
+        "preview_triangles": np.zeros(len(T), dtype=bool),
+        "drag_vertices": np.zeros(len(V_def), dtype=bool),
+        "drag_triangles": np.zeros(len(T), dtype=bool),
+        "dragging": False,
+        "prev_hand_center": None,
+        "hand_was_open": False,
+        "ref_body_box": None,
+    }
+
+    with mp_selfie_segmentation.SelfieSegmentation(model_selection=1) as segmenter, \
+         mp_hands.Hands(
+             static_image_mode=False,
+             max_num_hands=1,
+             model_complexity=1,
+             min_detection_confidence=0.5,
+             min_tracking_confidence=0.5,
+         ) as hands, \
+         mp_pose.Pose(
+             static_image_mode=False,
+             model_complexity=1,
+             smooth_landmarks=True,
+             enable_segmentation=False,
+             min_detection_confidence=0.5,
+             min_tracking_confidence=0.5,
+         ) as pose:
+
+        Lh.run_hand_brush_drag_loop_pose(
+            cap=cap,
+            segmenter=segmenter,
+            hands=hands,
+            pose=pose,
+            h=h,
+            w=w,
+            V_base=V_base,
+            V_def=V_def,
+            T=T,
+            step=step,
+            thresh=thresh,
+            feather=feather,
+            show_mask=show_mask,
+            brush_radius=brush_radius,
+            interaction_state=interaction_state,
+            offset_local=offset_local,
+        )
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+def test_hand_brush_drag_live(step=40, thresh=0.5, feather=0, show_mask=False):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: could not open camera.")
+        return
+    else:
+        print("Camera found")
+
+    ok, frame = cap.read()
+    if not ok:
+        print("Error: could not read initial frame.")
+        cap.release()
+        return
+
+    h, w = frame.shape[:2]
+
+    V_base, T, nx, ny = TMh.build_grid_mesh(w, h, step=step)
+    V_def = V_base.copy().astype(np.float32)
+
+    # persistent deformation stored in BODY-LOCAL coordinates
+    offset_local = np.zeros_like(V_base, dtype=np.float32)
+
+    brush_radius = max(45, int(min(w, h) * 0.08))
+
+    interaction_state = {
+        "preview_vertices": np.zeros(len(V_def), dtype=bool),
+        "preview_triangles": np.zeros(len(T), dtype=bool),
+        "drag_vertices": np.zeros(len(V_def), dtype=bool),
+        "drag_triangles": np.zeros(len(T), dtype=bool),
+        "dragging": False,
+        "prev_hand_center": None,
+        "hand_was_open": False,
+        "ref_body_box": None,
+    }
+
+    with mp_selfie_segmentation.SelfieSegmentation(model_selection=1) as segmenter, \
+         mp_hands.Hands(
+             static_image_mode=False,
+             max_num_hands=1,
+             model_complexity=1,
+             min_detection_confidence=0.5,
+             min_tracking_confidence=0.5,
+         ) as hands:
+
+        Lh.run_hand_brush_drag_loop(
+            cap=cap,
+            segmenter=segmenter,
+            hands=hands,
+            h=h,
+            w=w,
+            V_base=V_base,
+            V_def=V_def,
+            T=T,
+            step=step,
+            thresh=thresh,
+            feather=feather,
+            show_mask=show_mask,
+            brush_radius=brush_radius,
+            interaction_state=interaction_state,
+            offset_local=offset_local,
+        )
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+def test_hand_brush_drag_arap_live(step=40, thresh=0.5, feather=0, show_mask=False):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: could not open camera.")
+        return
+    else:
+        print("Camera found")
+
+    ok, frame = cap.read()
+    if not ok:
+        print("Error: could not read initial frame.")
+        cap.release()
+        return
+
+    h, w = frame.shape[:2]
+
+    V_base, T, nx, ny = TMh.build_grid_mesh(w, h, step=step)
+    V_def = V_base.copy().astype(np.float32)
+
+    # persistent deformation stored in BODY-LOCAL coordinates
+    offset_local = np.zeros_like(V_base, dtype=np.float32)
+
+    E = TMh.build_unique_edges(T)
+    neighbors = TMh.build_vertex_neighbors(len(V_base), E)
+    arap_cache = {
+        "E": E,
+        "neighbors": neighbors,
+    }
+
+    brush_radius = max(45, int(min(w, h) * 0.08))
+
+    interaction_state = {
+        "preview_vertices": np.zeros(len(V_def), dtype=bool),
+        "preview_triangles": np.zeros(len(T), dtype=bool),
+        "drag_vertices": np.zeros(len(V_def), dtype=bool),
+        "drag_triangles": np.zeros(len(T), dtype=bool),
+        "dragging": False,
+        "prev_hand_center": None,
+        "hand_was_open": False,
+        "ref_body_box": None,
+    }
+
+    with mp_selfie_segmentation.SelfieSegmentation(model_selection=1) as segmenter, \
+         mp_hands.Hands(
+             static_image_mode=False,
+             max_num_hands=1,
+             model_complexity=1,
+             min_detection_confidence=0.5,
+             min_tracking_confidence=0.5,
+         ) as hands:
+
+        Lh.run_hand_brush_drag_arap_loop(
+            cap=cap,
+            segmenter=segmenter,
+            hands=hands,
+            h=h,
+            w=w,
+            V_base=V_base,
+            V_def=V_def,
+            T=T,
+            step=step,
+            thresh=thresh,
+            feather=feather,
+            show_mask=show_mask,
+            brush_radius=brush_radius,
+            interaction_state=interaction_state,
+            offset_local=offset_local,
+            arap_cache=arap_cache,
+        )
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
 
 
 
@@ -524,4 +739,7 @@ def test_hand_brush_drag_live(step=40, thresh=0.5, feather=0, show_mask=True):
 # make_draw_mesh_test()
 # test_active_triangles_live()
 # test_hand_brush_triangles_live(step=40, thresh=0.5, feather=0, show_mask=True)
-test_hand_brush_drag_live(step=40, thresh=0.5, feather=0, show_mask=True)
+# test_hand_brush_drag_live(step=40, thresh=0.5, feather=0, show_mask=True)
+# test_hand_brush_drag_live_pose(step=40, thresh=0.5, feather=0, show_mask=False)
+# test_hand_brush_drag_live(step=40, thresh=0.5, feather=0, show_mask=False)
+test_hand_brush_drag_arap_live(step=40, thresh=0.5, feather=0, show_mask=False)

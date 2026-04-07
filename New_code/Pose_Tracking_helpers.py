@@ -4,6 +4,7 @@ import mediapipe as mp
 
 mp_selfie_segmentation = mp.solutions.selfie_segmentation
 mp_pose = mp.solutions.pose
+mp_hands = mp.solutions.hands
 
 
 def _pose_band_from_landmarks(landmarks, w, h,
@@ -169,3 +170,127 @@ def get_hand_state(rgb, hands, seg_mask, thresh, w, h):
         "extended_count": n_extended,
     })
     return state
+
+def get_torso_box_from_pose(pose_results, w, h, visibility_thresh=0.5):
+    """
+    Build a torso anchor box from shoulders + hips.
+    Returns None if landmarks are missing / unreliable.
+    """
+    if pose_results is None or pose_results.pose_landmarks is None:
+        return None
+
+    lms = pose_results.pose_landmarks.landmark
+
+    ids = {
+        "ls": mp_pose.PoseLandmark.LEFT_SHOULDER.value,
+        "rs": mp_pose.PoseLandmark.RIGHT_SHOULDER.value,
+        "lh": mp_pose.PoseLandmark.LEFT_HIP.value,
+        "rh": mp_pose.PoseLandmark.RIGHT_HIP.value,
+    }
+
+    pts = {}
+    for name, idx in ids.items():
+        lm = lms[idx]
+        if lm.visibility < visibility_thresh:
+            return None
+        pts[name] = np.array([lm.x * w, lm.y * h], dtype=np.float32)
+
+    shoulder_center = 0.5 * (pts["ls"] + pts["rs"])
+    hip_center = 0.5 * (pts["lh"] + pts["rh"])
+    torso_center = 0.5 * (shoulder_center + hip_center)
+
+    shoulder_width = np.linalg.norm(pts["rs"] - pts["ls"])
+    hip_width = np.linalg.norm(pts["rh"] - pts["lh"])
+    torso_width = max(1.0, 0.5 * (shoulder_width + hip_width))
+
+    torso_height = max(1.0, np.linalg.norm(hip_center - shoulder_center))
+
+    return {
+        "center": torso_center,         # (2,)
+        "shoulder_center": shoulder_center,
+        "hip_center": hip_center,
+        "width": float(torso_width),
+        "height": float(torso_height),
+        "ls": pts["ls"],
+        "rs": pts["rs"],
+        "lh": pts["lh"],
+        "rh": pts["rh"],
+    }
+
+def get_body_box_from_pose(pose_results, w, h, visibility_thresh=0.5):
+    """
+    Estimate a whole-body anchor box from a set of stable pose landmarks.
+    This does NOT limit the mesh to the torso; it only provides a transform
+    used to move the full-frame mesh with the person.
+    """
+    if pose_results is None or pose_results.pose_landmarks is None:
+        return None
+
+    lms = pose_results.pose_landmarks.landmark
+
+    landmark_ids = [
+        mp_pose.PoseLandmark.NOSE.value,
+        mp_pose.PoseLandmark.LEFT_SHOULDER.value,
+        mp_pose.PoseLandmark.RIGHT_SHOULDER.value,
+        mp_pose.PoseLandmark.LEFT_HIP.value,
+        mp_pose.PoseLandmark.RIGHT_HIP.value,
+        mp_pose.PoseLandmark.LEFT_KNEE.value,
+        mp_pose.PoseLandmark.RIGHT_KNEE.value,
+        mp_pose.PoseLandmark.LEFT_ANKLE.value,
+        mp_pose.PoseLandmark.RIGHT_ANKLE.value,
+    ]
+
+    pts = []
+    for idx in landmark_ids:
+        lm = lms[idx]
+        if lm.visibility >= visibility_thresh:
+            pts.append([lm.x * w, lm.y * h])
+
+    if len(pts) < 4:
+        return None
+
+    pts = np.array(pts, dtype=np.float32)
+
+    x0, y0 = pts.min(axis=0)
+    x1, y1 = pts.max(axis=0)
+
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+    bw = max(1.0, x1 - x0)
+    bh = max(1.0, y1 - y0)
+
+    return {
+        "center": np.array([cx, cy], dtype=np.float32),
+        "width": float(bw),
+        "height": float(bh),
+        "x0": int(x0),
+        "y0": int(y0),
+        "x1": int(x1),
+        "y1": int(y1),
+        "pts": pts,
+    }
+
+
+def body_bbox_from_mask(seg_mask, thresh=0.5):
+    ys, xs = np.where(seg_mask > thresh)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+
+    x0, x1 = xs.min(), xs.max()
+    y0, y1 = ys.min(), ys.max()
+
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+    bw = max(1.0, x1 - x0)
+    bh = max(1.0, y1 - y0)
+
+    return {
+        "cx": float(cx),
+        "cy": float(cy),
+        "w": float(bw),
+        "h": float(bh),
+        "x0": int(x0),
+        "x1": int(x1),
+        "y0": int(y0),
+        "y1": int(y1),
+    }
