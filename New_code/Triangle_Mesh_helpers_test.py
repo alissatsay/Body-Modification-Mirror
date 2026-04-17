@@ -159,7 +159,7 @@ def make_draw_mesh_test():
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
-def draw_active_triangles(frame_bgr, V, T, active, color=(0, 255, 0), thickness=1):
+def draw_active_triangles(frame_bgr, V, T, active, color=(0, 0, 0), thickness=1):
     """
     Draw only triangles where active[k] == True.
     """
@@ -214,7 +214,7 @@ def test_active_triangles_live(step=40, thresh=0.5, feather=0, show_mask=True):
 
             active = TMh.active_triangles_from_mask(V, T, seg_mask, thresh=thresh)
 
-            vis = draw_active_triangles(frame, V, T, active, color=(0, 255, 0), thickness=1)
+            vis = draw_active_triangles(frame, V, T, active, color=(0, 0, 0), thickness=1)
 
             # Debug overlay text
             cv2.putText(
@@ -371,8 +371,8 @@ def test_hand_brush_triangles_live(step=40, thresh=0.5, feather=0, show_mask=Tru
                 T=T,
                 active_mask=active,
                 affected_mask=affected_triangles,
-                pale_color=(0, 255, 0),
-                bright_color=(0, 255, 0),
+                pale_color=(0, 0, 0),
+                bright_color=(0, 0, 0),
                 pale_alpha=0.12,
                 bright_alpha=0.42,
                 line_thickness=1,
