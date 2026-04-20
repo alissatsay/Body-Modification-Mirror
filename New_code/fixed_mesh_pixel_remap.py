@@ -103,6 +103,43 @@ def rotate_frame(frame_bgr, deg=ROTATE_DEG, direction=ROTATE_DIR):
         borderMode=cv2.BORDER_REPLICATE
     )
 
+def estimate_body_yaw(cur_pts, ref_metrics):
+    ls = cur_pts.get("left_shoulder")
+    rs = cur_pts.get("right_shoulder")
+    lh = cur_pts.get("left_hip")
+    rh = cur_pts.get("right_hip")
+    nose = cur_pts.get("nose")
+
+    if ls is None or rs is None or lh is None or rh is None:
+        return 0.0, 0.0
+
+    cur_shoulder_w = float(np.linalg.norm(rs - ls))
+    cur_hip_w = float(np.linalg.norm(rh - lh))
+
+    ref_shoulder_w = max(ref_metrics["shoulder_width"], 1.0)
+    ref_hip_w = max(ref_metrics["hip_width"], 1.0)
+
+    shoulder_ratio = np.clip(cur_shoulder_w / ref_shoulder_w, 0.0, 1.2)
+    hip_ratio = np.clip(cur_hip_w / ref_hip_w, 0.0, 1.2)
+
+    width_ratio = 0.5 * (shoulder_ratio + hip_ratio)
+
+    # width_ratio near 1 -> frontal
+    # width_ratio much smaller -> sideways
+    yaw_amount = np.clip((1.0 - width_ratio) / 0.55, 0.0, 1.0)
+
+    yaw_sign = 0.0
+    if nose is not None:
+        shoulder_mid = 0.5 * (ls + rs)
+        shoulder_vec = rs - ls
+        shoulder_len = np.linalg.norm(shoulder_vec)
+        if shoulder_len > 1e-6:
+            shoulder_x = shoulder_vec / shoulder_len
+            nose_offset = np.dot(nose - shoulder_mid, shoulder_x)
+            yaw_sign = float(np.sign(nose_offset))
+
+    return float(yaw_amount), float(yaw_sign)
+
 def triangle_area2(tri):
     """
     Twice the signed triangle area magnitude.
@@ -1468,7 +1505,7 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
         initialized = False
         max_init_frames = 300
         full_pose_streak = 0
-        required_streak = 20
+        required_streak =20
 
         mask_accum = None
         mask_count = 0
@@ -1621,4 +1658,4 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
     cv2.destroyAllWindows()
 
 
-test_hand_brush_drag_arap_live_skeleton(step=40, thresh=0.5, feather=0, show_mask=False)
+test_hand_brush_drag_arap_live_skeleton(step=15, thresh=0.5, feather=0, show_mask=False)
