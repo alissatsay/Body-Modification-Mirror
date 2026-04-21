@@ -2637,18 +2637,18 @@ def load_beauty_standard_overlay(size=120, filename="beauty_standard.png"):
 def _draw_bs_timer_overlay(canvas, bs_img, size, margin, elapsed, duration):
     """
     Paste bs_img in the top-right corner of canvas and draw a clockwise
-    blue arc timer outline that grows from 0° → 360° over `duration` seconds.
-    canvas : uint8 BGR, shape (H, W, 3)  — the OUTPUT-resolution frame
+    rectangular border timer that grows around the image over `duration` seconds.
+    canvas : uint8 BGR, shape (H, W, 3)
     """
     H, W = canvas.shape[:2]
 
-    # ---- paste image ----
     x0 = W - margin - size
     y0 = margin
 
+    # ---- paste image ----
     if bs_img is not None:
         roi = canvas[y0:y0+size, x0:x0+size]
-        if bs_img.shape[2] == 4:          # RGBA → blend with alpha
+        if bs_img.shape[2] == 4:
             alpha = bs_img[:, :, 3:4].astype(np.float32) / 255.0
             rgb   = bs_img[:, :, :3].astype(np.float32)
             blended = (alpha * rgb + (1.0 - alpha) * roi.astype(np.float32))
@@ -2656,30 +2656,42 @@ def _draw_bs_timer_overlay(canvas, bs_img, size, margin, elapsed, duration):
         else:
             canvas[y0:y0+size, x0:x0+size] = bs_img
 
-    # ---- draw arc ----
-    frac   = float(np.clip(elapsed / max(duration, 1.0), 0.0, 1.0))
-    sweep  = int(round(frac * 360))          # degrees covered so far
-    cx     = x0 + size // 2
-    cy     = y0 + size // 2
-    radius = size // 2 + 6                   # slightly outside the image
-    thick  = 4
-    color  = (255, 80, 0)                    # blue in BGR
+    # ---- draw rectangular progress border ----
+    frac  = float(np.clip(elapsed / max(duration, 1.0), 0.0, 1.0))
+    color = (203, 120, 255)   # blue-orange in BGR
+    thick = 8
+    pad   = thick // 2 + 2  # offset so stroke sits just outside the image
 
-    if sweep > 0:
-        # OpenCV ellipse: angle=0 is 3-o'clock, increases counter-clockwise.
-        # We want clockwise from 12-o'clock (= -90° in OpenCV convention).
-        # startAngle=-90, endAngle=-90+sweep  →  clockwise growth.
-        cv2.ellipse(
-            canvas,
-            (cx, cy),
-            (radius, radius),
-            angle=0,
-            startAngle=-90,
-            endAngle=-90 + sweep,
-            color=color,
-            thickness=thick,
-            lineType=cv2.LINE_AA,
-        )
+    # Corner coords of the border rectangle (outside the image by `pad` px)
+    rx0 = x0 - pad
+    ry0 = y0 - pad
+    rx1 = x0 + size + pad
+    ry1 = y0 + size + pad
+
+    # Perimeter split into 4 segments, starting from top-left corner, going clockwise:
+    #   top edge (left→right), right edge (top→bottom),
+    #   bottom edge (right→left), left edge (bottom→top)
+    perimeter = 4 * (size + 2 * pad)
+    draw_len  = frac * perimeter
+
+    segments = [
+        # (start_pt, end_pt, length)
+        ((rx0, ry0), (rx1, ry0), rx1 - rx0),   # top
+        ((rx1, ry0), (rx1, ry1), ry1 - ry0),   # right
+        ((rx1, ry1), (rx0, ry1), rx1 - rx0),   # bottom
+        ((rx0, ry1), (rx0, ry0), ry1 - ry0),   # left
+    ]
+
+    remaining = draw_len
+    for (sx, sy), (ex, ey), seg_len in segments:
+        if remaining <= 0:
+            break
+        t = min(remaining, seg_len) / seg_len
+        ex_draw = int(round(sx + t * (ex - sx)))
+        ey_draw = int(round(sy + t * (ey - sy)))
+        cv2.line(canvas, (int(sx), int(sy)), (ex_draw, ey_draw),
+                 color, thick, lineType=cv2.LINE_AA)
+        remaining -= seg_len
 
     return canvas
 
@@ -2709,7 +2721,7 @@ def run_hand_brush_drag_arap_loop_skeleton(
     binding = interaction_state["binding"]
 
     # ---- Beauty-standard overlay setup ----
-    _BS_SIZE = 120          # square size on the OUTPUT canvas (pixels)
+    _BS_SIZE = 240          # square size on the OUTPUT canvas (pixels)          # square size on the OUTPUT canvas (pixels)
     _BS_MARGIN = 18         # distance from top-right corner
     _TIMER_DURATION = 180.0 # seconds (3 minutes)
     _timer_start = time.time()
@@ -3039,10 +3051,10 @@ def run_hand_brush_drag_arap_loop_skeleton(
                         V=V_def,
                         T=T,
                         tri_mask=affected_triangles,
-                        fill_color=(0, 140, 255),
-                        fill_alpha=0.16,
-                        edge_color=(0, 140, 255),
-                        edge_thickness=2,
+                        fill_color=(255, 150, 246),
+                        fill_alpha=0.56,
+                        edge_color=(255, 150, 246),
+                        edge_thickness=1,
                         edge_alpha=0.95,
                     )
                 else:
@@ -3051,10 +3063,10 @@ def run_hand_brush_drag_arap_loop_skeleton(
                         V=V_def,
                         T=T,
                         tri_mask=affected_triangles,
-                        fill_color=(0, 255, 0),
+                        fill_color=(255, 150, 246),
                         fill_alpha=0.14,
-                        edge_color=(0, 255, 0),
-                        edge_thickness=2,
+                        edge_color=(255, 150, 246),
+                        edge_thickness=1,
                         edge_alpha=0.95,
                     )
 
@@ -3209,7 +3221,7 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
     neighbors = TMh.build_vertex_neighbors(len(V_base), E)
     arap_cache = {"E": E, "neighbors": neighbors}
 
-    brush_radius = max(45, int(min(w, h) * 0.1))
+    brush_radius = max(45, int(min(w, h) * 0.07))
 
     interaction_state = {
         "preview_vertices": np.zeros(len(V_def), dtype=bool),
