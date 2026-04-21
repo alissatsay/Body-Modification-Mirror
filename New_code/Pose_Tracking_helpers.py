@@ -72,33 +72,59 @@ def _pose_band_from_landmarks(landmarks, w, h,
 
 def _is_open_palm(hand_landmarks, handedness_label=None, require_extended=4):
     """
-    Simple open-palm test:
-    - index/middle/ring/pinky count as extended if tip is above pip in image coords
-    - thumb is checked with a simple x-direction heuristic
-    Returns (is_open, num_extended)
+    Orientation-invariant open-palm test.
+
+    A finger counts as extended if:
+    - tip is substantially farther from wrist than pip is, and
+    - tip is also farther from MCP than pip is
+
+    This is much less sensitive to whether the fingers point up, down, or sideways.
+    Returns:
+        (is_open, num_extended)
     """
     lm = hand_landmarks.landmark
 
-    # Finger landmark indices
-    tips = [8, 12, 16, 20]
-    pips = [6, 10, 14, 18]
+    wrist = np.array([lm[0].x, lm[0].y], dtype=np.float32)
+
+    # index, middle, ring, pinky:
+    # (mcp, pip, tip)
+    finger_defs = [
+        (5, 6, 8),    # index
+        (9, 10, 12),  # middle
+        (13, 14, 16), # ring
+        (17, 18, 20), # pinky
+    ]
 
     extended = 0
 
-    # For the 4 fingers: in image coordinates, smaller y means "higher"
-    for tip_idx, pip_idx in zip(tips, pips):
-        if lm[tip_idx].y < lm[pip_idx].y:
+    for mcp_idx, pip_idx, tip_idx in finger_defs:
+        mcp = np.array([lm[mcp_idx].x, lm[mcp_idx].y], dtype=np.float32)
+        pip = np.array([lm[pip_idx].x, lm[pip_idx].y], dtype=np.float32)
+        tip = np.array([lm[tip_idx].x, lm[tip_idx].y], dtype=np.float32)
+
+        # Distances in normalized image coordinates
+        d_tip_wrist = np.linalg.norm(tip - wrist)
+        d_pip_wrist = np.linalg.norm(pip - wrist)
+        d_tip_mcp = np.linalg.norm(tip - mcp)
+        d_pip_mcp = np.linalg.norm(pip - mcp)
+
+        # Finger is extended if tip is meaningfully farther out than pip.
+        if (d_tip_wrist > 1.15 * d_pip_wrist) and (d_tip_mcp > 1.10 * d_pip_mcp):
             extended += 1
 
-    # Optional thumb check, not required for open palm by default
-    thumb_extended = False
-    if handedness_label == "Right":
-        thumb_extended = lm[4].x < lm[3].x
-    elif handedness_label == "Left":
-        thumb_extended = lm[4].x > lm[3].x
+    # Thumb: use a simple distance-based cue rather than x-direction.
+    thumb_cmc = np.array([lm[1].x, lm[1].y], dtype=np.float32)
+    thumb_ip  = np.array([lm[3].x, lm[3].y], dtype=np.float32)
+    thumb_tip = np.array([lm[4].x, lm[4].y], dtype=np.float32)
 
+    d_tip_cmc = np.linalg.norm(thumb_tip - thumb_cmc)
+    d_ip_cmc = np.linalg.norm(thumb_ip - thumb_cmc)
+    thumb_extended = d_tip_cmc > 1.10 * d_ip_cmc
+
+    num_extended = extended + int(thumb_extended)
     is_open = extended >= require_extended
-    return is_open, extended + int(thumb_extended)
+
+    return is_open, num_extended
 
 def _hand_center_px(hand_landmarks, w, h):
     """
@@ -136,6 +162,7 @@ def get_hand_state(rgb, hands, seg_mask, thresh, w, h):
         "is_fist": False,
         "over_body": False,
         "extended_count": 0,
+        "handedness": None,
     }
 
     if not hand_results.multi_hand_landmarks:
@@ -168,6 +195,7 @@ def get_hand_state(rgb, hands, seg_mask, thresh, w, h):
         "is_fist": is_fist,
         "over_body": over_body,
         "extended_count": n_extended,
+        "handedness": handedness_label,
     })
     return state
 
