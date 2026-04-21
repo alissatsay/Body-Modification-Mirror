@@ -2585,9 +2585,16 @@ def run_hand_brush_drag_arap_loop_skeleton(
     arap_cache,
     window_name="Hand brush drag on skeleton mesh",
 ):
+    import os
+
     global SHOW_MESH_OUTLINE
     print("Entered run_hand_brush_drag_arap_loop_skeleton")
     binding = interaction_state["binding"]
+
+    # Save exactly what is displayed to the user
+    save_dir = os.path.join("saved_frames", "arap_")
+    os.makedirs(save_dir, exist_ok=True)
+    frame_counter = 0
 
     while True:
         ok, frame_raw = cap.read()
@@ -2873,7 +2880,6 @@ def run_hand_brush_drag_arap_loop_skeleton(
             )
 
         if SHOW_MESH_OUTLINE:
-            # Current/original visualization mode
             vis = TMh._draw_triangle_overlay(
                 frame=vis,
                 V=V_def,
@@ -2899,8 +2905,6 @@ def run_hand_brush_drag_arap_loop_skeleton(
                 cv2.circle(vis, (cx, cy), 4, brush_color, -1, lineType=cv2.LINE_AA)
 
         else:
-            # Mesh-hidden visualization mode:
-            # show ONLY the affected triangles, with subtle fill + stronger outlines.
             if np.any(affected_triangles):
                 if interaction_state["dragging"]:
                     vis = draw_filled_triangle_highlight(
@@ -2908,7 +2912,7 @@ def run_hand_brush_drag_arap_loop_skeleton(
                         V=V_def,
                         T=T,
                         tri_mask=affected_triangles,
-                        fill_color=(0, 140, 255),   # orange for active drag
+                        fill_color=(0, 140, 255),
                         fill_alpha=0.16,
                         edge_color=(0, 140, 255),
                         edge_thickness=2,
@@ -2920,94 +2924,102 @@ def run_hand_brush_drag_arap_loop_skeleton(
                         V=V_def,
                         T=T,
                         tri_mask=affected_triangles,
-                        fill_color=(0, 255, 0),     # green for preview
+                        fill_color=(0, 255, 0),
                         fill_alpha=0.14,
                         edge_color=(0, 255, 0),
                         edge_thickness=2,
                         edge_alpha=0.95,
                     )
 
-        cv2.putText(
-            vis,
-            f"fixed active: {int(active.sum())}/{len(T)}",
-            (12, 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA
-        )
-        mode_text = "layered render" if SHOW_LAYERED_RENDER else "single-sheet render"
+        # cv2.putText(
+        #     vis,
+        #     f"fixed active: {int(active.sum())}/{len(T)}",
+        #     (12, 28),
+        #     cv2.FONT_HERSHEY_SIMPLEX,
+        #     0.7,
+        #     (255, 255, 255),
+        #     2,
+        #     cv2.LINE_AA
+        # )
+        # mode_text = "layered render" if SHOW_LAYERED_RENDER else "single-sheet render"
 
-        cv2.putText(
-            vis,
-            f"skeleton-attached mesh | {mode_text} | m mesh on/off | q quit | r reset offsets",
-            (12, 56),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA
-        )
+        # cv2.putText(
+        #     vis,
+        #     f"skeleton-attached mesh | {mode_text} | m mesh on/off | q quit | r reset offsets",
+        #     (12, 56),
+        #     cv2.FONT_HERSHEY_SIMPLEX,
+        #     0.65,
+        #     (255, 255, 255),
+        #     2,
+        #     cv2.LINE_AA
+        # )
 
-        if SHOW_LAYERED_RENDER and USE_DYNAMIC_YAW_RENDER_ORDER:
-            cv2.putText(
-                vis,
-                f"yaw: {yaw_amount:.2f} | sign: {yaw_sign:+.0f} | state: {yaw_state_txt}",
-                (12, 84),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA
-            )
+        # if SHOW_LAYERED_RENDER and USE_DYNAMIC_YAW_RENDER_ORDER:
+        #     cv2.putText(
+        #         vis,
+        #         f"yaw: {yaw_amount:.2f} | sign: {yaw_sign:+.0f} | state: {yaw_state_txt}",
+        #         (12, 84),
+        #         cv2.FONT_HERSHEY_SIMPLEX,
+        #         0.55,
+        #         (255, 255, 255),
+        #         2,
+        #         cv2.LINE_AA
+        #     )
 
-            cv2.putText(
-                vis,
-                f"sign_raw: {yaw_debug['sign_value']:+.2f} | sign_smooth: {yaw_debug['sign_value_smooth']:+.2f} | width_ratio: {yaw_debug['width_ratio']:.2f}",
-                (12, 132),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.46,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA
-            )
+        #     cv2.putText(
+        #         vis,
+        #         f"sign_raw: {yaw_debug['sign_value']:+.2f} | sign_smooth: {yaw_debug['sign_value_smooth']:+.2f} | width_ratio: {yaw_debug['width_ratio']:.2f}",
+        #         (12, 132),
+        #         cv2.FONT_HERSHEY_SIMPLEX,
+        #         0.46,
+        #         (255, 255, 255),
+        #         1,
+        #         cv2.LINE_AA
+        #     )
 
-        if SHOW_RENDER_GROUP_DEBUG:
-            cv2.putText(
-                vis,
-                "debug render groups: torso yellow | head magenta | L arm green | R arm orange | L leg blue | R leg red",
-                (12, 108),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA
-            )
+        # if SHOW_RENDER_GROUP_DEBUG:
+        #     cv2.putText(
+        #         vis,
+        #         "debug render groups: torso yellow | head magenta | L arm green | R arm orange | L leg blue | R leg red",
+        #         (12, 108),
+        #         cv2.FONT_HERSHEY_SIMPLEX,
+        #         0.48,
+        #         (255, 255, 255),
+        #         1,
+        #         cv2.LINE_AA
+        #     )
 
-        if SHOW_LAYERED_RENDER:
-            cv2.putText(
-                vis,
-                f"leg overlap: {leg_overlap_frac:.3f} | leg score: {leg_front_score:+.1f} | leg override: {leg_override_used}",
-                (12, 156),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.46,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA
-            )
-            cv2.putText(
-                vis,
-                f"L arm ov: {left_arm_overlap_frac:.3f} | R arm ov: {right_arm_overlap_frac:.3f} | L score: {left_arm_score:+.1f} | R score: {right_arm_score:+.1f} | arm override: {arm_override_used}",
-                (12, 180),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.46,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA
-            )
+        # if SHOW_LAYERED_RENDER:
+        #     cv2.putText(
+        #         vis,
+        #         f"leg overlap: {leg_overlap_frac:.3f} | leg score: {leg_front_score:+.1f} | leg override: {leg_override_used}",
+        #         (12, 156),
+        #         cv2.FONT_HERSHEY_SIMPLEX,
+        #         0.46,
+        #         (255, 255, 255),
+        #         1,
+        #         cv2.LINE_AA
+        #     )
+        #     cv2.putText(
+        #         vis,
+        #         f"L arm ov: {left_arm_overlap_frac:.3f} | R arm ov: {right_arm_overlap_frac:.3f} | L score: {left_arm_score:+.1f} | R score: {right_arm_score:+.1f} | arm override: {arm_override_used}",
+        #         (12, 180),
+        #         cv2.FONT_HERSHEY_SIMPLEX,
+        #         0.46,
+        #         (255, 255, 255),
+        #         1,
+        #         cv2.LINE_AA
+        #     )
 
         vis_display = cv2.resize(vis, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
+
+        # Save exactly what the user sees every 10 frames
+        if frame_counter % 10 == 0:
+            save_path = os.path.join(save_dir, f"frame_{frame_counter:06d}.png")
+            cv2.imwrite(save_path, vis_display)
+
+        frame_counter += 1
+
         cv2.imshow(window_name, vis_display)
 
         if show_mask:
