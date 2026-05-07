@@ -91,7 +91,7 @@ RENDER_GROUP_COLORS = {
 SHOW_RENDER_GROUP_DEBUG = False
 RENDER_GROUP_DEBUG_ALPHA = 0.28
 
-SHOW_MESH_OUTLINE = False
+SHOW_MESH_OUTLINE = True
 
 SHOW_LAYERED_RENDER = False
 
@@ -245,24 +245,9 @@ def capture_background_plate(cap, h, w, n_frames=20, window_name="Background cap
     bg = np.clip(acc / float(got), 0, 255).astype(np.uint8)
     return bg
 
-def show_countdown(
-    cap,
-    h,
-    w,
-    seconds,
-    message,
-    window_name,
-    bs_img=None,
-    bs_size=120,
-    bs_margin=18,
-    overlay_timer_start=None,
-    overlay_timer_duration=180.0,
-):
+def show_countdown(cap, h, w, seconds, message, window_name):
     """
     Display a live countdown overlay on camera feed.
-
-    Optional beauty-standard overlay parameters are passed in explicitly so this
-    function does not depend on local variables from another function.
     """
     start_time = time.time()
 
@@ -304,22 +289,6 @@ def show_countdown(
         )
 
         vis_display = cv2.resize(vis, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
-
-        if bs_img is not None:
-            if overlay_timer_start is None:
-                overlay_elapsed = 0.0
-            else:
-                overlay_elapsed = time.time() - overlay_timer_start
-
-            vis_display = _draw_bs_timer_overlay(
-                canvas=vis_display,
-                bs_img=bs_img,
-                size=bs_size,
-                margin=bs_margin,
-                elapsed=overlay_elapsed,
-                duration=overlay_timer_duration,
-            )
-
         cv2.imshow(window_name, vis_display)
 
         key = cv2.waitKey(1) & 0xFF
@@ -2597,104 +2566,6 @@ def finalize_init_mask(mask_accum, count, avg_thresh=0.30, dilate_ksize=11, clos
 
     return mask_bin.astype(np.float32)
 
-def _resolve_beauty_standard_image_path(filename="beauty_standard.png"):
-    """
-    Resolve the beauty-standard image path robustly relative to this script first,
-    then fall back to the current working directory.
-    """
-    import os
-
-    candidates = []
-
-    if "__file__" in globals():
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        candidates.append(os.path.join(script_dir, "beauty_standard_images", filename))
-
-    candidates.append(os.path.join(os.getcwd(), "beauty_standard_images", filename))
-
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-
-    return candidates[0] if candidates else os.path.join("beauty_standard_images", filename)
-
-
-def load_beauty_standard_overlay(size=120, filename="beauty_standard.png"):
-    """
-    Load and resize the beauty-standard reference image.
-    Returns (image_or_none, resolved_path).
-    """
-    path = _resolve_beauty_standard_image_path(filename)
-    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-
-    if img is None:
-        return None, path
-
-    img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
-    return img, path
-
-
-def _draw_bs_timer_overlay(canvas, bs_img, size, margin, elapsed, duration):
-    """
-    Paste bs_img in the top-right corner of canvas and draw a clockwise
-    rectangular border timer that grows around the image over `duration` seconds.
-    canvas : uint8 BGR, shape (H, W, 3)
-    """
-    H, W = canvas.shape[:2]
-
-    x0 = W - margin - size
-    y0 = margin
-
-    # ---- paste image ----
-    if bs_img is not None:
-        roi = canvas[y0:y0+size, x0:x0+size]
-        if bs_img.shape[2] == 4:
-            alpha = bs_img[:, :, 3:4].astype(np.float32) / 255.0
-            rgb   = bs_img[:, :, :3].astype(np.float32)
-            blended = (alpha * rgb + (1.0 - alpha) * roi.astype(np.float32))
-            canvas[y0:y0+size, x0:x0+size] = np.clip(blended, 0, 255).astype(np.uint8)
-        else:
-            canvas[y0:y0+size, x0:x0+size] = bs_img
-
-    # ---- draw rectangular progress border ----
-    frac  = float(np.clip(elapsed / max(duration, 1.0), 0.0, 1.0))
-    color = (203, 120, 255)   # blue-orange in BGR
-    thick = 8
-    pad   = thick // 2 + 2  # offset so stroke sits just outside the image
-
-    # Corner coords of the border rectangle (outside the image by `pad` px)
-    rx0 = x0 - pad
-    ry0 = y0 - pad
-    rx1 = x0 + size + pad
-    ry1 = y0 + size + pad
-
-    # Perimeter split into 4 segments, starting from top-left corner, going clockwise:
-    #   top edge (left→right), right edge (top→bottom),
-    #   bottom edge (right→left), left edge (bottom→top)
-    perimeter = 4 * (size + 2 * pad)
-    draw_len  = frac * perimeter
-
-    segments = [
-        # (start_pt, end_pt, length)
-        ((rx0, ry0), (rx1, ry0), rx1 - rx0),   # top
-        ((rx1, ry0), (rx1, ry1), ry1 - ry0),   # right
-        ((rx1, ry1), (rx0, ry1), rx1 - rx0),   # bottom
-        ((rx0, ry1), (rx0, ry0), ry1 - ry0),   # left
-    ]
-
-    remaining = draw_len
-    for (sx, sy), (ex, ey), seg_len in segments:
-        if remaining <= 0:
-            break
-        t = min(remaining, seg_len) / seg_len
-        ex_draw = int(round(sx + t * (ex - sx)))
-        ey_draw = int(round(sy + t * (ey - sy)))
-        cv2.line(canvas, (int(sx), int(sy)), (ex_draw, ey_draw),
-                 color, thick, lineType=cv2.LINE_AA)
-        remaining -= seg_len
-
-    return canvas
-
 def run_hand_brush_drag_arap_loop_skeleton(
     cap,
     segmenter,
@@ -2714,27 +2585,12 @@ def run_hand_brush_drag_arap_loop_skeleton(
     arap_cache,
     window_name="Hand brush drag on skeleton mesh",
 ):
-    import os
-
     global SHOW_MESH_OUTLINE
     print("Entered run_hand_brush_drag_arap_loop_skeleton")
     binding = interaction_state["binding"]
 
-    # ---- Beauty-standard overlay setup ----
-    _BS_SIZE = 240          # square size on the OUTPUT canvas (pixels)          # square size on the OUTPUT canvas (pixels)
-    _BS_MARGIN = 18         # distance from top-right corner
-    _TIMER_DURATION = 180.0 # seconds (3 minutes)
-    _timer_start = time.time()
-
-    _bs_img_raw, _bs_img_path = load_beauty_standard_overlay(size=_BS_SIZE)
-    if _bs_img_raw is None:
-        print(f"WARNING: could not load beauty standard image: {_bs_img_path}")
-
-    # Save exactly what is displayed to the user
-    # save_dir = os.path.join("saved_frames", "arap_")
-    # os.makedirs(save_dir, exist_ok=True)
-    # frame_counter = 0
-
+    fps_start = time.time()
+    fps_counter = 0
     while True:
         ok, frame_raw = cap.read()
         if not ok:
@@ -3019,6 +2875,7 @@ def run_hand_brush_drag_arap_loop_skeleton(
             )
 
         if SHOW_MESH_OUTLINE:
+            # Current/original visualization mode
             vis = TMh._draw_triangle_overlay(
                 frame=vis,
                 V=V_def,
@@ -3044,6 +2901,8 @@ def run_hand_brush_drag_arap_loop_skeleton(
                 cv2.circle(vis, (cx, cy), 4, brush_color, -1, lineType=cv2.LINE_AA)
 
         else:
+            # Mesh-hidden visualization mode:
+            # show ONLY the affected triangles, with subtle fill + stronger outlines.
             if np.any(affected_triangles):
                 if interaction_state["dragging"]:
                     vis = draw_filled_triangle_highlight(
@@ -3051,10 +2910,10 @@ def run_hand_brush_drag_arap_loop_skeleton(
                         V=V_def,
                         T=T,
                         tri_mask=affected_triangles,
-                        fill_color=(255, 150, 246),
-                        fill_alpha=0.65,
-                        edge_color=(255, 150, 246),
-                        edge_thickness=1,
+                        fill_color=(0, 140, 255),   # orange for active drag
+                        fill_alpha=0.16,
+                        edge_color=(0, 140, 255),
+                        edge_thickness=2,
                         edge_alpha=0.95,
                     )
                 else:
@@ -3063,113 +2922,94 @@ def run_hand_brush_drag_arap_loop_skeleton(
                         V=V_def,
                         T=T,
                         tri_mask=affected_triangles,
-                        fill_color=(255, 150, 246),
+                        fill_color=(0, 255, 0),     # green for preview
                         fill_alpha=0.14,
-                        edge_color=(255, 150, 246),
-                        edge_thickness=1,
+                        edge_color=(0, 255, 0),
+                        edge_thickness=2,
                         edge_alpha=0.95,
                     )
 
-        # cv2.putText(
-        #     vis,
-        #     f"fixed active: {int(active.sum())}/{len(T)}",
-        #     (12, 28),
-        #     cv2.FONT_HERSHEY_SIMPLEX,
-        #     0.7,
-        #     (255, 255, 255),
-        #     2,
-        #     cv2.LINE_AA
-        # )
-        # mode_text = "layered render" if SHOW_LAYERED_RENDER else "single-sheet render"
+        cv2.putText(
+            vis,
+            f"fixed active: {int(active.sum())}/{len(T)}",
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+        mode_text = "layered render" if SHOW_LAYERED_RENDER else "single-sheet render"
 
-        # cv2.putText(
-        #     vis,
-        #     f"skeleton-attached mesh | {mode_text} | m mesh on/off | q quit | r reset offsets",
-        #     (12, 56),
-        #     cv2.FONT_HERSHEY_SIMPLEX,
-        #     0.65,
-        #     (255, 255, 255),
-        #     2,
-        #     cv2.LINE_AA
-        # )
+        cv2.putText(
+            vis,
+            f"skeleton-attached mesh | {mode_text} | m mesh on/off | q quit | r reset offsets",
+            (12, 56),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
 
-        # if SHOW_LAYERED_RENDER and USE_DYNAMIC_YAW_RENDER_ORDER:
-        #     cv2.putText(
-        #         vis,
-        #         f"yaw: {yaw_amount:.2f} | sign: {yaw_sign:+.0f} | state: {yaw_state_txt}",
-        #         (12, 84),
-        #         cv2.FONT_HERSHEY_SIMPLEX,
-        #         0.55,
-        #         (255, 255, 255),
-        #         2,
-        #         cv2.LINE_AA
-        #     )
-
-        #     cv2.putText(
-        #         vis,
-        #         f"sign_raw: {yaw_debug['sign_value']:+.2f} | sign_smooth: {yaw_debug['sign_value_smooth']:+.2f} | width_ratio: {yaw_debug['width_ratio']:.2f}",
-        #         (12, 132),
-        #         cv2.FONT_HERSHEY_SIMPLEX,
-        #         0.46,
-        #         (255, 255, 255),
-        #         1,
-        #         cv2.LINE_AA
-        #     )
-
-        # if SHOW_RENDER_GROUP_DEBUG:
-        #     cv2.putText(
-        #         vis,
-        #         "debug render groups: torso yellow | head magenta | L arm green | R arm orange | L leg blue | R leg red",
-        #         (12, 108),
-        #         cv2.FONT_HERSHEY_SIMPLEX,
-        #         0.48,
-        #         (255, 255, 255),
-        #         1,
-        #         cv2.LINE_AA
-        #     )
-
-        # if SHOW_LAYERED_RENDER:
-        #     cv2.putText(
-        #         vis,
-        #         f"leg overlap: {leg_overlap_frac:.3f} | leg score: {leg_front_score:+.1f} | leg override: {leg_override_used}",
-        #         (12, 156),
-        #         cv2.FONT_HERSHEY_SIMPLEX,
-        #         0.46,
-        #         (255, 255, 255),
-        #         1,
-        #         cv2.LINE_AA
-        #     )
-        #     cv2.putText(
-        #         vis,
-        #         f"L arm ov: {left_arm_overlap_frac:.3f} | R arm ov: {right_arm_overlap_frac:.3f} | L score: {left_arm_score:+.1f} | R score: {right_arm_score:+.1f} | arm override: {arm_override_used}",
-        #         (12, 180),
-        #         cv2.FONT_HERSHEY_SIMPLEX,
-        #         0.46,
-        #         (255, 255, 255),
-        #         1,
-        #         cv2.LINE_AA
-        #     )
-
-        vis_display = cv2.resize(vis, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
-
-        if _bs_img_raw is not None:
-            _elapsed = time.time() - _timer_start
-            vis_display = _draw_bs_timer_overlay(
-                canvas=vis_display,
-                bs_img=_bs_img_raw,
-                size=_BS_SIZE,
-                margin=_BS_MARGIN,
-                elapsed=_elapsed,
-                duration=_TIMER_DURATION,
+        if SHOW_LAYERED_RENDER and USE_DYNAMIC_YAW_RENDER_ORDER:
+            cv2.putText(
+                vis,
+                f"yaw: {yaw_amount:.2f} | sign: {yaw_sign:+.0f} | state: {yaw_state_txt}",
+                (12, 84),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA
             )
 
-        # Save exactly what the user sees every 10 frames
-        # if frame_counter % 10 == 0:
-        #     save_path = os.path.join(save_dir, f"frame_{frame_counter:06d}.png")
-        #     cv2.imwrite(save_path, vis_display)
+            cv2.putText(
+                vis,
+                f"sign_raw: {yaw_debug['sign_value']:+.2f} | sign_smooth: {yaw_debug['sign_value_smooth']:+.2f} | width_ratio: {yaw_debug['width_ratio']:.2f}",
+                (12, 132),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.46,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA
+            )
 
-        # frame_counter += 1
+        if SHOW_RENDER_GROUP_DEBUG:
+            cv2.putText(
+                vis,
+                "debug render groups: torso yellow | head magenta | L arm green | R arm orange | L leg blue | R leg red",
+                (12, 108),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA
+            )
 
+        if SHOW_LAYERED_RENDER:
+            cv2.putText(
+                vis,
+                f"leg overlap: {leg_overlap_frac:.3f} | leg score: {leg_front_score:+.1f} | leg override: {leg_override_used}",
+                (12, 156),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.46,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA
+            )
+            cv2.putText(
+                vis,
+                f"L arm ov: {left_arm_overlap_frac:.3f} | R arm ov: {right_arm_overlap_frac:.3f} | L score: {left_arm_score:+.1f} | R score: {right_arm_score:+.1f} | arm override: {arm_override_used}",
+                (12, 180),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.46,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA
+            )
+
+        vis_display = cv2.resize(vis, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
         cv2.imshow(window_name, vis_display)
 
         if show_mask:
@@ -3177,6 +3017,15 @@ def run_hand_brush_drag_arap_loop_skeleton(
             mask_display = cv2.resize(mask_vis, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_NEAREST)
             cv2.imshow("Segmentation mask", mask_display)
 
+        fps_counter += 1
+        elapsed = time.time() - fps_start
+
+        if elapsed >= 1.0:
+            fps = fps_counter / elapsed
+            print(f"FPS: {fps:.1f}")
+
+            fps_counter = 0
+            fps_start = time.time()
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
@@ -3221,7 +3070,7 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
     neighbors = TMh.build_vertex_neighbors(len(V_base), E)
     arap_cache = {"E": E, "neighbors": neighbors}
 
-    brush_radius = max(45, int(min(w, h) * 0.07))
+    brush_radius = max(45, int(min(w, h) * 0.1))
 
     interaction_state = {
         "preview_vertices": np.zeros(len(V_def), dtype=bool),
@@ -3313,6 +3162,7 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
         mask_accum = None
         mask_count = 0
         best_stable_pts = None
+        
 
         for k in range(max_init_frames):
             ok, fr = cap.read()
