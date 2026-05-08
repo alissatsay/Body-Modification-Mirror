@@ -543,3 +543,42 @@ def run_hand_brush_drag_loop(
             interaction_state["dragging"] = False
             interaction_state["prev_hand_center"] = None
             interaction_state["hand_was_open"] = False
+
+
+def body_bbox_from_mask(seg_mask, thresh=0.5):
+    ys, xs = np.where(seg_mask > thresh)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+
+    x0, x1 = xs.min(), xs.max()
+    y0, y1 = ys.min(), ys.max()
+
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+    bw = max(1.0, x1 - x0)
+    bh = max(1.0, y1 - y0)
+
+    return {
+        "cx": float(cx),
+        "cy": float(cy),
+        "w": float(bw),
+        "h": float(bh),
+        "x0": int(x0),
+        "x1": int(x1),
+        "y0": int(y0),
+        "y1": int(y1),
+    }
+
+
+def make_tracked_mesh(V_base, ref_box, cur_box):
+    """
+    Move the base mesh with the person's body using bbox translation + scale.
+    """
+    sx = cur_box["w"] / ref_box["w"]
+    sy = cur_box["h"] / ref_box["h"]
+
+    V_track = V_base.copy().astype(np.float32)
+    V_track[:, 0] = (V_base[:, 0] - ref_box["cx"]) * sx + cur_box["cx"]
+    V_track[:, 1] = (V_base[:, 1] - ref_box["cy"]) * sy + cur_box["cy"]
+
+    return V_track, sx, sy
