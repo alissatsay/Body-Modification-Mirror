@@ -4,6 +4,7 @@ import mediapipe as mp
 
 mp_selfie_segmentation = mp.solutions.selfie_segmentation
 mp_pose = mp.solutions.pose
+mp_hands = mp.solutions.hands
 
 
 def _pose_band_from_landmarks(landmarks, w, h,
@@ -71,33 +72,59 @@ def _pose_band_from_landmarks(landmarks, w, h,
 
 def _is_open_palm(hand_landmarks, handedness_label=None, require_extended=4):
     """
-    Simple open-palm test:
-    - index/middle/ring/pinky count as extended if tip is above pip in image coords
-    - thumb is checked with a simple x-direction heuristic
-    Returns (is_open, num_extended)
+    Orientation-invariant open-palm test.
+
+    A finger counts as extended if:
+    - tip is substantially farther from wrist than pip is, and
+    - tip is also farther from MCP than pip is
+
+    This is much less sensitive to whether the fingers point up, down, or sideways.
+    Returns:
+        (is_open, num_extended)
     """
     lm = hand_landmarks.landmark
 
-    # Finger landmark indices
-    tips = [8, 12, 16, 20]
-    pips = [6, 10, 14, 18]
+    wrist = np.array([lm[0].x, lm[0].y], dtype=np.float32)
+
+    # index, middle, ring, pinky:
+    # (mcp, pip, tip)
+    finger_defs = [
+        (5, 6, 8),    # index
+        (9, 10, 12),  # middle
+        (13, 14, 16), # ring
+        (17, 18, 20), # pinky
+    ]
 
     extended = 0
 
-    # For the 4 fingers: in image coordinates, smaller y means "higher"
-    for tip_idx, pip_idx in zip(tips, pips):
-        if lm[tip_idx].y < lm[pip_idx].y:
+    for mcp_idx, pip_idx, tip_idx in finger_defs:
+        mcp = np.array([lm[mcp_idx].x, lm[mcp_idx].y], dtype=np.float32)
+        pip = np.array([lm[pip_idx].x, lm[pip_idx].y], dtype=np.float32)
+        tip = np.array([lm[tip_idx].x, lm[tip_idx].y], dtype=np.float32)
+
+        # Distances in normalized image coordinates
+        d_tip_wrist = np.linalg.norm(tip - wrist)
+        d_pip_wrist = np.linalg.norm(pip - wrist)
+        d_tip_mcp = np.linalg.norm(tip - mcp)
+        d_pip_mcp = np.linalg.norm(pip - mcp)
+
+        # Finger is extended if tip is meaningfully farther out than pip.
+        if (d_tip_wrist > 1.15 * d_pip_wrist) and (d_tip_mcp > 1.10 * d_pip_mcp):
             extended += 1
 
-    # Optional thumb check, not required for open palm by default
-    thumb_extended = False
-    if handedness_label == "Right":
-        thumb_extended = lm[4].x < lm[3].x
-    elif handedness_label == "Left":
-        thumb_extended = lm[4].x > lm[3].x
+    # Thumb: use a simple distance-based cue rather than x-direction.
+    thumb_cmc = np.array([lm[1].x, lm[1].y], dtype=np.float32)
+    thumb_ip  = np.array([lm[3].x, lm[3].y], dtype=np.float32)
+    thumb_tip = np.array([lm[4].x, lm[4].y], dtype=np.float32)
 
+    d_tip_cmc = np.linalg.norm(thumb_tip - thumb_cmc)
+    d_ip_cmc = np.linalg.norm(thumb_ip - thumb_cmc)
+    thumb_extended = d_tip_cmc > 1.10 * d_ip_cmc
+
+    num_extended = extended + int(thumb_extended)
     is_open = extended >= require_extended
-    return is_open, extended + int(thumb_extended)
+
+    return is_open, num_extended
 
 def _hand_center_px(hand_landmarks, w, h):
     """
@@ -135,6 +162,7 @@ def get_hand_state(rgb, hands, seg_mask, thresh, w, h):
         "is_fist": False,
         "over_body": False,
         "extended_count": 0,
+        "handedness": None,
     }
 
     if not hand_results.multi_hand_landmarks:
@@ -167,5 +195,130 @@ def get_hand_state(rgb, hands, seg_mask, thresh, w, h):
         "is_fist": is_fist,
         "over_body": over_body,
         "extended_count": n_extended,
+        "handedness": handedness_label,
     })
     return state
+
+def get_torso_box_from_pose(pose_results, w, h, visibility_thresh=0.5):
+    """
+    Build a torso anchor box from shoulders + hips.
+    Returns None if landmarks are missing / unreliable.
+    """
+    if pose_results is None or pose_results.pose_landmarks is None:
+        return None
+
+    lms = pose_results.pose_landmarks.landmark
+
+    ids = {
+        "ls": mp_pose.PoseLandmark.LEFT_SHOULDER.value,
+        "rs": mp_pose.PoseLandmark.RIGHT_SHOULDER.value,
+        "lh": mp_pose.PoseLandmark.LEFT_HIP.value,
+        "rh": mp_pose.PoseLandmark.RIGHT_HIP.value,
+    }
+
+    pts = {}
+    for name, idx in ids.items():
+        lm = lms[idx]
+        if lm.visibility < visibility_thresh:
+            return None
+        pts[name] = np.array([lm.x * w, lm.y * h], dtype=np.float32)
+
+    shoulder_center = 0.5 * (pts["ls"] + pts["rs"])
+    hip_center = 0.5 * (pts["lh"] + pts["rh"])
+    torso_center = 0.5 * (shoulder_center + hip_center)
+
+    shoulder_width = np.linalg.norm(pts["rs"] - pts["ls"])
+    hip_width = np.linalg.norm(pts["rh"] - pts["lh"])
+    torso_width = max(1.0, 0.5 * (shoulder_width + hip_width))
+
+    torso_height = max(1.0, np.linalg.norm(hip_center - shoulder_center))
+
+    return {
+        "center": torso_center,         # (2,)
+        "shoulder_center": shoulder_center,
+        "hip_center": hip_center,
+        "width": float(torso_width),
+        "height": float(torso_height),
+        "ls": pts["ls"],
+        "rs": pts["rs"],
+        "lh": pts["lh"],
+        "rh": pts["rh"],
+    }
+
+def get_body_box_from_pose(pose_results, w, h, visibility_thresh=0.5):
+    """
+    Estimate a whole-body anchor box from a set of stable pose landmarks.
+    This does NOT limit the mesh to the torso; it only provides a transform
+    used to move the full-frame mesh with the person.
+    """
+    if pose_results is None or pose_results.pose_landmarks is None:
+        return None
+
+    lms = pose_results.pose_landmarks.landmark
+
+    landmark_ids = [
+        mp_pose.PoseLandmark.NOSE.value,
+        mp_pose.PoseLandmark.LEFT_SHOULDER.value,
+        mp_pose.PoseLandmark.RIGHT_SHOULDER.value,
+        mp_pose.PoseLandmark.LEFT_HIP.value,
+        mp_pose.PoseLandmark.RIGHT_HIP.value,
+        mp_pose.PoseLandmark.LEFT_KNEE.value,
+        mp_pose.PoseLandmark.RIGHT_KNEE.value,
+        mp_pose.PoseLandmark.LEFT_ANKLE.value,
+        mp_pose.PoseLandmark.RIGHT_ANKLE.value,
+    ]
+
+    pts = []
+    for idx in landmark_ids:
+        lm = lms[idx]
+        if lm.visibility >= visibility_thresh:
+            pts.append([lm.x * w, lm.y * h])
+
+    if len(pts) < 4:
+        return None
+
+    pts = np.array(pts, dtype=np.float32)
+
+    x0, y0 = pts.min(axis=0)
+    x1, y1 = pts.max(axis=0)
+
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+    bw = max(1.0, x1 - x0)
+    bh = max(1.0, y1 - y0)
+
+    return {
+        "center": np.array([cx, cy], dtype=np.float32),
+        "width": float(bw),
+        "height": float(bh),
+        "x0": int(x0),
+        "y0": int(y0),
+        "x1": int(x1),
+        "y1": int(y1),
+        "pts": pts,
+    }
+
+
+def body_bbox_from_mask(seg_mask, thresh=0.5):
+    ys, xs = np.where(seg_mask > thresh)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+
+    x0, x1 = xs.min(), xs.max()
+    y0, y1 = ys.min(), ys.max()
+
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+    bw = max(1.0, x1 - x0)
+    bh = max(1.0, y1 - y0)
+
+    return {
+        "cx": float(cx),
+        "cy": float(cy),
+        "w": float(bw),
+        "h": float(bh),
+        "x0": int(x0),
+        "x1": int(x1),
+        "y0": int(y0),
+        "y1": int(y1),
+    }

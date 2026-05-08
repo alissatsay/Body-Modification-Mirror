@@ -2,8 +2,11 @@ import cv2
 import numpy as np
 import mediapipe as mp
 import time
+from scipy import sparse
+from scipy.sparse.linalg import spsolve
 
 import Pose_Tracking_helpers as PTh
+
 
 state = {
     "dragging": False,
@@ -289,6 +292,48 @@ def update_drag_state(V_def, T, active, hand_state, state, brush_radius):
 
     return V_def, state
 
+def make_pose_tracked_mesh(V_base, ref_torso, cur_torso):
+    """
+    Track mesh by torso center + independent x/y scale.
+    This is axis-aligned and deliberately simple/stable.
+    """
+    sx = cur_torso["width"] / max(ref_torso["width"], 1e-6)
+    sy = cur_torso["height"] / max(ref_torso["height"], 1e-6)
+
+    ref_c = ref_torso["center"]
+    cur_c = cur_torso["center"]
+
+    V_track = V_base.copy().astype(np.float32)
+    V_track[:, 0] = (V_base[:, 0] - ref_c[0]) * sx + cur_c[0]
+    V_track[:, 1] = (V_base[:, 1] - ref_c[1]) * sy + cur_c[1]
+
+    return V_track, sx, sy
+
+
+def draw_torso_debug(vis, torso):
+    if torso is None:
+        return vis
+
+    pts = [
+        torso["ls"],
+        torso["rs"],
+        torso["rh"],
+        torso["lh"],
+    ]
+    pts = np.round(np.array(pts)).astype(np.int32)
+
+    cv2.polylines(vis, [pts], isClosed=True, color=(255, 180, 0), thickness=2, lineType=cv2.LINE_AA)
+
+    c = tuple(np.round(torso["center"]).astype(np.int32))
+    sc = tuple(np.round(torso["shoulder_center"]).astype(np.int32))
+    hc = tuple(np.round(torso["hip_center"]).astype(np.int32))
+
+    cv2.circle(vis, c, 5, (0, 255, 255), -1, lineType=cv2.LINE_AA)
+    cv2.circle(vis, sc, 4, (255, 0, 255), -1, lineType=cv2.LINE_AA)
+    cv2.circle(vis, hc, 4, (255, 0, 255), -1, lineType=cv2.LINE_AA)
+
+    return vis
+
 def run_hand_brush_drag_loop(
     cap,
     segmenter,
@@ -544,41 +589,686 @@ def run_hand_brush_drag_loop(
             interaction_state["prev_hand_center"] = None
             interaction_state["hand_was_open"] = False
 
+def make_body_tracked_mesh(V_base, ref_body, cur_body):
+    """
+    Move the FULL mesh using the current body box.
+    The mesh remains full-frame; this just applies a global body-following transform.
+    """
+    sx = cur_body["width"] / max(ref_body["width"], 1e-6)
+    sy = cur_body["height"] / max(ref_body["height"], 1e-6)
 
-def body_bbox_from_mask(seg_mask, thresh=0.5):
-    ys, xs = np.where(seg_mask > thresh)
-    if len(xs) == 0 or len(ys) == 0:
-        return None
+    ref_c = ref_body["center"]
+    cur_c = cur_body["center"]
 
-    x0, x1 = xs.min(), xs.max()
-    y0, y1 = ys.min(), ys.max()
+    V_track = V_base.copy().astype(np.float32)
+    V_track[:, 0] = (V_base[:, 0] - ref_c[0]) * sx + cur_c[0]
+    V_track[:, 1] = (V_base[:, 1] - ref_c[1]) * sy + cur_c[1]
 
-    cx = 0.5 * (x0 + x1)
-    cy = 0.5 * (y0 + y1)
-    bw = max(1.0, x1 - x0)
-    bh = max(1.0, y1 - y0)
+    return V_track, sx, sy
 
-    return {
-        "cx": float(cx),
-        "cy": float(cy),
-        "w": float(bw),
-        "h": float(bh),
-        "x0": int(x0),
-        "x1": int(x1),
-        "y0": int(y0),
-        "y1": int(y1),
-    }
 
+def draw_body_debug(vis, body_box):
+    if body_box is None:
+        return vis
+
+    cv2.rectangle(
+        vis,
+        (body_box["x0"], body_box["y0"]),
+        (body_box["x1"], body_box["y1"]),
+        (255, 180, 0),
+        2,
+        lineType=cv2.LINE_AA
+    )
+
+    c = tuple(np.round(body_box["center"]).astype(np.int32))
+    cv2.circle(vis, c, 5, (0, 255, 255), -1, lineType=cv2.LINE_AA)
+
+    for p in body_box["pts"]:
+        pt = tuple(np.round(p).astype(np.int32))
+        cv2.circle(vis, pt, 3, (255, 0, 255), -1, lineType=cv2.LINE_AA)
+
+    return vis
 
 def make_tracked_mesh(V_base, ref_box, cur_box):
     """
-    Move the base mesh with the person's body using bbox translation + scale.
+    Build a version of V_base that follows the person's current position/scale.
     """
-    sx = cur_box["w"] / ref_box["w"]
-    sy = cur_box["h"] / ref_box["h"]
+    sx = cur_box["w"] / max(ref_box["w"], 1e-6)
+    sy = cur_box["h"] / max(ref_box["h"], 1e-6)
 
     V_track = V_base.copy().astype(np.float32)
     V_track[:, 0] = (V_base[:, 0] - ref_box["cx"]) * sx + cur_box["cx"]
     V_track[:, 1] = (V_base[:, 1] - ref_box["cy"]) * sy + cur_box["cy"]
 
     return V_track, sx, sy
+
+def build_unique_edges(T):
+    """
+    T: (m,3) triangle indices
+    returns E: (k,2) unique undirected edges
+    """
+    edges = set()
+    for tri in T:
+        a, b, c = map(int, tri)
+        edges.add(tuple(sorted((a, b))))
+        edges.add(tuple(sorted((b, c))))
+        edges.add(tuple(sorted((c, a))))
+    return np.array(sorted(edges), dtype=np.int32)
+
+
+def build_vertex_neighbors(nv, E):
+    nbrs = [[] for _ in range(nv)]
+    for i, j in E:
+        nbrs[i].append(j)
+        nbrs[j].append(i)
+    return nbrs
+
+
+def vertex_mask_from_active_triangles(T, active_triangles, nv):
+    mask = np.zeros(nv, dtype=bool)
+    if np.any(active_triangles):
+        mask[np.unique(T[active_triangles].ravel())] = True
+    return mask
+
+
+def expand_vertex_region(seed_mask, neighbors, rings=4, valid_mask=None):
+    """
+    Expand a boolean vertex mask by graph rings.
+    valid_mask restricts growth if provided.
+    """
+    region = seed_mask.copy()
+    frontier = np.where(seed_mask)[0]
+
+    for _ in range(rings):
+        new_ids = []
+        for v in frontier:
+            for nb in neighbors[v]:
+                if valid_mask is not None and not valid_mask[nb]:
+                    continue
+                if not region[nb]:
+                    region[nb] = True
+                    new_ids.append(nb)
+        frontier = np.array(new_ids, dtype=np.int32)
+        if len(frontier) == 0:
+            break
+
+    return region
+
+
+def boundary_of_region(region_mask, neighbors):
+    """
+    Boundary = vertices inside region with at least one neighbor outside region.
+    """
+    boundary = np.zeros_like(region_mask)
+    inside = np.where(region_mask)[0]
+
+    for v in inside:
+        for nb in neighbors[v]:
+            if not region_mask[nb]:
+                boundary[v] = True
+                break
+
+    return boundary
+
+def compute_handle_falloff_weights(V_ref, handle_mask, neighbors, region_mask, power=1.6):
+    """
+    Build radial-like falloff weights inside the selected region.
+
+    - handle vertices get weight 1.0
+    - surrounding region vertices get weights decreasing with graph distance
+    - outside region gets 0
+
+    Returns
+    -------
+    weights : (n,) float32 in [0,1]
+    """
+    n = len(V_ref)
+    weights = np.zeros(n, dtype=np.float32)
+
+    handle_ids = np.where(handle_mask)[0]
+    if len(handle_ids) == 0:
+        return weights
+
+    # Use handle centroid in the reference mesh as the center
+    center = np.mean(V_ref[handle_ids], axis=0)
+
+    region_ids = np.where(region_mask)[0]
+    if len(region_ids) == 0:
+        return weights
+
+    d = np.linalg.norm(V_ref[region_ids] - center[None, :], axis=1)
+
+    handle_d = np.linalg.norm(V_ref[handle_ids] - center[None, :], axis=1)
+    inner_r = float(max(np.max(handle_d), 1.0))
+    outer_r = float(max(np.max(d), inner_r + 1.0))
+
+    denom = max(outer_r - inner_r, 1e-6)
+
+    # 1 at/inside handle zone, then smooth falloff to 0 at outer boundary
+    for idx, vid in enumerate(region_ids):
+        dv = d[idx]
+        if dv <= inner_r:
+            w = 1.0
+        else:
+            t = np.clip((dv - inner_r) / denom, 0.0, 1.0)
+            w = (1.0 - t) ** power
+        weights[vid] = float(w)
+
+    weights[handle_mask] = 1.0
+    return weights
+
+def apply_arap_drag_step_2(
+    V_track,
+    V_def,
+    T,
+    active_triangles,
+    drag_vertices,
+    arap_cache,
+    delta_xy,
+    region_rings=6,
+    n_iters=5,
+    falloff_power=1.6,
+    ref_track_weight=0.25,
+    boundary_track_weight=0.10,
+):
+    """
+    One incremental ARAP drag step in screen coordinates.
+
+    Compromise version:
+    - rigidity reference is a blend of current deformed shape and tracked neutral shape
+    - boundary is pinned mostly to current deformed shape, only slightly toward tracked shape
+    - handle region uses falloff
+    """
+    nv = len(V_def)
+    neighbors = arap_cache["neighbors"]
+
+    active_vertex_mask = vertex_mask_from_active_triangles(T, active_triangles, nv)
+    handle_mask = drag_vertices & active_vertex_mask
+
+    if not np.any(handle_mask):
+        return V_def.copy()
+
+    region_mask = expand_vertex_region(
+        seed_mask=handle_mask,
+        neighbors=neighbors,
+        rings=region_rings,
+        valid_mask=active_vertex_mask,
+    )
+
+    boundary_mask = boundary_of_region(region_mask, neighbors)
+    boundary_mask &= ~handle_mask
+
+    X_init = V_def.copy()
+
+    # Compromise rigidity reference:
+    # mostly preserve current edited shape, but regularize toward live neutral tracked shape
+    X_ref = (
+        (1.0 - ref_track_weight) * X_init +
+        ref_track_weight * V_track
+    ).astype(np.float32)
+
+    # Compromise boundary targets:
+    # keep outer ring mostly where it already is, with only mild pull toward tracked neutral
+    boundary_targets = (
+        (1.0 - boundary_track_weight) * X_init +
+        boundary_track_weight * V_track
+    ).astype(np.float32)
+
+    delta_xy = np.asarray(delta_xy, dtype=np.float32)
+
+    weights = compute_handle_falloff_weights(
+        V_ref=X_init,
+        handle_mask=handle_mask,
+        neighbors=neighbors,
+        region_mask=region_mask,
+        power=falloff_power,
+    )
+
+    handle_targets = X_init.copy()
+
+    # Full motion for actual handle vertices
+    handle_targets[handle_mask] += delta_xy
+
+    # Soft pull for nearby interior vertices
+    soft_mask = region_mask & (~handle_mask) & (~boundary_mask)
+    if np.any(soft_mask):
+        handle_targets[soft_mask] += weights[soft_mask, None] * delta_xy
+
+    X_new = arap_deform_2d_2(
+        X_ref=X_ref,
+        X_init=X_init,
+        neighbors=neighbors,
+        region_mask=region_mask,
+        handle_mask=handle_mask,
+        handle_targets=handle_targets,
+        boundary_mask=boundary_mask,
+        boundary_targets=boundary_targets,
+        n_iters=n_iters,
+    )
+
+    return X_new
+
+def arap_deform_2d_2(
+    X_ref,
+    X_init,
+    neighbors,
+    region_mask,
+    handle_mask,
+    handle_targets,
+    boundary_mask=None,
+    boundary_targets=None,
+    n_iters=3,
+):
+    """
+    2D ARAP on a local region.
+
+    X_ref:
+        reference geometry used for rigidity preservation
+    X_init:
+        current deformed geometry used as initialization
+    boundary_targets:
+        explicit positions for the boundary pins
+    """
+    n = len(X_ref)
+    X = X_init.copy()
+
+    if boundary_mask is None:
+        boundary_mask = np.zeros(n, dtype=bool)
+
+    if boundary_targets is None:
+        boundary_targets = X_init.copy()
+
+    constrained = (handle_mask | boundary_mask) & region_mask
+    free = region_mask & (~constrained)
+
+    region_ids = np.where(region_mask)[0]
+    free_ids = np.where(free)[0]
+
+    if len(region_ids) == 0:
+        return X
+
+    X[handle_mask] = handle_targets[handle_mask]
+    X[boundary_mask] = boundary_targets[boundary_mask]
+
+    def w_ij(i, j):
+        return 1.0
+
+    if len(free_ids) == 0:
+        return X
+
+    id_map = -np.ones(n, dtype=np.int32)
+    id_map[free_ids] = np.arange(len(free_ids))
+
+    rows, cols, vals = [], [], []
+
+    for i in free_ids:
+        diag = 0.0
+        for j in neighbors[i]:
+            if not region_mask[j]:
+                continue
+            wij = w_ij(i, j)
+            diag += wij
+            if free[j]:
+                rows.append(id_map[i])
+                cols.append(id_map[j])
+                vals.append(-wij)
+
+        rows.append(id_map[i])
+        cols.append(id_map[i])
+        vals.append(diag)
+
+    Lff = sparse.csr_matrix(
+        (vals, (rows, cols)),
+        shape=(len(free_ids), len(free_ids))
+    )
+
+    for _ in range(n_iters):
+        # ----- local step -----
+        R = np.tile(np.eye(2, dtype=np.float32)[None, :, :], (n, 1, 1))
+
+        for i in region_ids:
+            S = np.zeros((2, 2), dtype=np.float64)
+            pi = X_ref[i]
+            xi = X[i]
+
+            for j in neighbors[i]:
+                if not region_mask[j]:
+                    continue
+                wij = w_ij(i, j)
+                pj = X_ref[j]
+                xj = X[j]
+
+                p_ij = (pi - pj).reshape(2, 1)
+                x_ij = (xi - xj).reshape(2, 1)
+                S += wij * (x_ij @ p_ij.T)
+
+            U, _, Vt = np.linalg.svd(S)
+            Ri = U @ Vt
+            if np.linalg.det(Ri) < 0:
+                U[:, -1] *= -1
+                Ri = U @ Vt
+
+            R[i] = Ri.astype(np.float32)
+
+        # ----- global step -----
+        bx = np.zeros(len(free_ids), dtype=np.float64)
+        by = np.zeros(len(free_ids), dtype=np.float64)
+
+        for i in free_ids:
+            rhs = np.zeros(2, dtype=np.float64)
+
+            for j in neighbors[i]:
+                if not region_mask[j]:
+                    continue
+
+                wij = w_ij(i, j)
+                p_ij = (X_ref[i] - X_ref[j]).astype(np.float64)
+                rhs += 0.5 * wij * ((R[i] + R[j]) @ p_ij)
+
+                if constrained[j]:
+                    rhs += wij * X[j]
+
+            bx[id_map[i]] = rhs[0]
+            by[id_map[i]] = rhs[1]
+
+        x_sol = spsolve(Lff, bx)
+        y_sol = spsolve(Lff, by)
+
+        X[free_ids, 0] = x_sol
+        X[free_ids, 1] = y_sol
+
+        X[handle_mask] = handle_targets[handle_mask]
+        X[boundary_mask] = boundary_targets[boundary_mask]
+
+    return X
+
+def clamp_vector_magnitudes(vectors, max_mag):
+    """
+    Clamp row-wise 2D vector magnitudes to max_mag.
+    vectors: (N,2)
+    """
+    out = vectors.copy().astype(np.float32)
+    mags = np.linalg.norm(out, axis=1, keepdims=True)
+    safe = np.maximum(mags, 1e-6)
+    scale = np.minimum(1.0, float(max_mag) / safe)
+    out *= scale
+    return out
+
+def limit_edge_stretch_step(X_new, X_ref, neighbors, region_mask, max_stretch_ratio=1.18, n_passes=2):
+    """
+    Limit how much edges are allowed to stretch in THIS step relative to X_ref.
+
+    max_stretch_ratio = 1.18 means:
+        an edge in X_new may be at most 18% longer than it was in X_ref.
+
+    This does not pull toward the original mesh; it only limits local per-step distortion.
+    """
+    X = X_new.copy().astype(np.float32)
+    region_ids = np.where(region_mask)[0]
+
+    for _ in range(max(1, int(n_passes))):
+        for i in region_ids:
+            for j in neighbors[i]:
+                if j <= i or not region_mask[j]:
+                    continue
+
+                ref_vec = X_ref[j] - X_ref[i]
+                ref_len = float(np.linalg.norm(ref_vec))
+                if ref_len < 1e-6:
+                    continue
+
+                cur_vec = X[j] - X[i]
+                cur_len = float(np.linalg.norm(cur_vec))
+                if cur_len < 1e-6:
+                    continue
+
+                max_len = max_stretch_ratio * ref_len
+                if cur_len > max_len:
+                    mid = 0.5 * (X[i] + X[j])
+                    dir_ij = cur_vec / cur_len
+                    half = 0.5 * max_len * dir_ij
+                    X[i] = mid - half
+                    X[j] = mid + half
+
+    return X
+
+def apply_arap_drag_step(
+    V_track,
+    V_def,
+    T,
+    active_triangles,
+    drag_vertices,
+    arap_cache,
+    delta_xy,
+    region_rings=6,
+    n_iters=5,
+    falloff_power=1.6,
+    handle_strength=0.55,
+    max_handle_step_px=18.0,
+    max_soft_step_px=10.0,
+    max_stretch_ratio=1.18,
+):
+    """
+    One incremental ARAP drag step in screen coordinates.
+
+    More restrictive version:
+    - current mesh remains the ARAP reference
+    - handle targets are softened
+    - per-step displacement is capped
+    - post-solve edge stretch is limited
+
+    This preserves cumulative edits while making each step less wild.
+    """
+    nv = len(V_def)
+    neighbors = arap_cache["neighbors"]
+
+    active_vertex_mask = vertex_mask_from_active_triangles(T, active_triangles, nv)
+    handle_mask = drag_vertices & active_vertex_mask
+
+    if not np.any(handle_mask):
+        return V_def.copy()
+
+    region_mask = expand_vertex_region(
+        seed_mask=handle_mask,
+        neighbors=neighbors,
+        rings=region_rings,
+        valid_mask=active_vertex_mask,
+    )
+
+    boundary_mask = boundary_of_region(region_mask, neighbors)
+    boundary_mask &= ~handle_mask
+
+    # Keep cumulative-edit behavior
+    X_ref = V_def.copy()
+    X_init = V_def.copy()
+    boundary_targets = X_init.copy()
+
+    delta_xy = np.asarray(delta_xy, dtype=np.float32).reshape(1, 2)
+
+    weights = compute_handle_falloff_weights(
+        V_ref=X_init,
+        handle_mask=handle_mask,
+        neighbors=neighbors,
+        region_mask=region_mask,
+        power=falloff_power,
+    )
+
+    handle_targets = X_init.copy()
+
+    # ---------- hard handle region: softened + capped ----------
+    if np.any(handle_mask):
+        handle_delta = np.repeat(delta_xy, int(np.sum(handle_mask)), axis=0)
+        handle_delta *= float(handle_strength)
+        handle_delta = clamp_vector_magnitudes(handle_delta, max_handle_step_px)
+        handle_targets[handle_mask] += handle_delta
+
+    # ---------- surrounding region: falloff + softer cap ----------
+    soft_mask = region_mask & (~handle_mask) & (~boundary_mask)
+    if np.any(soft_mask):
+        soft_delta = weights[soft_mask, None] * delta_xy
+        soft_delta = clamp_vector_magnitudes(soft_delta, max_soft_step_px)
+        handle_targets[soft_mask] += soft_delta
+
+    X_new = arap_deform_2d(
+        X_ref=X_ref,
+        X_init=X_init,
+        neighbors=neighbors,
+        region_mask=region_mask,
+        handle_mask=handle_mask,
+        handle_targets=handle_targets,
+        boundary_mask=boundary_mask,
+        boundary_targets=boundary_targets,
+        n_iters=n_iters,
+    )
+
+    # ---------- post-solve restriction ----------
+    X_new = limit_edge_stretch_step(
+        X_new=X_new,
+        X_ref=X_ref,
+        neighbors=neighbors,
+        region_mask=region_mask,
+        max_stretch_ratio=max_stretch_ratio,
+        n_passes=2,
+    )
+
+    # Keep actual boundary pinned
+    X_new[boundary_mask] = boundary_targets[boundary_mask]
+
+    return X_new
+
+def arap_deform_2d(
+    X_ref,
+    X_init,
+    neighbors,
+    region_mask,
+    handle_mask,
+    handle_targets,
+    boundary_mask=None,
+    boundary_targets=None,
+    n_iters=3,
+):
+    """
+    2D ARAP on a local region.
+
+    Here:
+    - X_ref should be the current mesh shape used as the rigidity reference
+    - X_init should be the current mesh shape used as the initialization
+    - boundary_targets should usually also come from the current mesh shape
+    """
+    n = len(X_ref)
+    X = X_init.copy()
+
+    if boundary_mask is None:
+        boundary_mask = np.zeros(n, dtype=bool)
+
+    if boundary_targets is None:
+        boundary_targets = X_init.copy()
+
+    constrained = (handle_mask | boundary_mask) & region_mask
+    free = region_mask & (~constrained)
+
+    region_ids = np.where(region_mask)[0]
+    free_ids = np.where(free)[0]
+
+    if len(region_ids) == 0:
+        return X
+
+    X[handle_mask] = handle_targets[handle_mask]
+    X[boundary_mask] = boundary_targets[boundary_mask]
+
+    def w_ij(i, j):
+        edge_len = float(np.linalg.norm(X_ref[i] - X_ref[j]))
+        edge_len = max(edge_len, 1e-3)
+
+        # Inverse-length weighting, lightly clamped for stability
+        w = 1.0 / edge_len
+
+        # Clamp to avoid extreme values
+        return float(np.clip(w, 0.02, 0.25))
+
+    if len(free_ids) == 0:
+        return X
+
+    id_map = -np.ones(n, dtype=np.int32)
+    id_map[free_ids] = np.arange(len(free_ids))
+
+    rows, cols, vals = [], [], []
+
+    for i in free_ids:
+        diag = 0.0
+        for j in neighbors[i]:
+            if not region_mask[j]:
+                continue
+            wij = w_ij(i, j)
+            diag += wij
+            if free[j]:
+                rows.append(id_map[i])
+                cols.append(id_map[j])
+                vals.append(-wij)
+
+        rows.append(id_map[i])
+        cols.append(id_map[i])
+        vals.append(diag)
+
+    Lff = sparse.csr_matrix(
+        (vals, (rows, cols)),
+        shape=(len(free_ids), len(free_ids))
+    )
+
+    for _ in range(n_iters):
+        R = np.tile(np.eye(2, dtype=np.float32)[None, :, :], (n, 1, 1))
+
+        for i in region_ids:
+            S = np.zeros((2, 2), dtype=np.float64)
+            pi = X_ref[i]
+            xi = X[i]
+
+            for j in neighbors[i]:
+                if not region_mask[j]:
+                    continue
+                wij = w_ij(i, j)
+                pj = X_ref[j]
+                xj = X[j]
+
+                p_ij = (pi - pj).reshape(2, 1)
+                x_ij = (xi - xj).reshape(2, 1)
+                S += wij * (x_ij @ p_ij.T)
+
+            U, _, Vt = np.linalg.svd(S)
+            Ri = U @ Vt
+            if np.linalg.det(Ri) < 0:
+                U[:, -1] *= -1
+                Ri = U @ Vt
+
+            R[i] = Ri.astype(np.float32)
+
+        bx = np.zeros(len(free_ids), dtype=np.float64)
+        by = np.zeros(len(free_ids), dtype=np.float64)
+
+        for i in free_ids:
+            rhs = np.zeros(2, dtype=np.float64)
+
+            for j in neighbors[i]:
+                if not region_mask[j]:
+                    continue
+
+                wij = w_ij(i, j)
+                p_ij = (X_ref[i] - X_ref[j]).astype(np.float64)
+                rhs += 0.5 * wij * ((R[i] + R[j]) @ p_ij)
+
+                if constrained[j]:
+                    rhs += wij * X[j]
+
+            bx[id_map[i]] = rhs[0]
+            by[id_map[i]] = rhs[1]
+
+        x_sol = spsolve(Lff, bx)
+        y_sol = spsolve(Lff, by)
+
+        X[free_ids, 0] = x_sol
+        X[free_ids, 1] = y_sol
+
+        X[handle_mask] = handle_targets[handle_mask]
+        X[boundary_mask] = boundary_targets[boundary_mask]
+
+    return X
