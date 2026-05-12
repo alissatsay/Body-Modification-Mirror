@@ -396,6 +396,9 @@ def get_hand_state(rgb, hands, seg_mask, thresh, w, h):
         "handedness":     None,
         "is_peace":       False,
         "pinch_dist":     1.0,
+        # Normalised wrist + index MCP for pointer projection
+        "wrist_norm":     (0.5, 0.5),
+        "index_mcp_norm": (0.5, 0.5),
     }
 
     if not hand_results.multi_hand_landmarks:
@@ -423,6 +426,7 @@ def get_hand_state(rgb, hands, seg_mask, thresh, w, h):
     is_peace  = _is_peace_sign(hand_landmarks)
     pinch_dist = _pinch_distance(hand_landmarks)
 
+    lm = hand_landmarks.landmark
     state.update({
         "detected":       True,
         "center":         (cx, cy),
@@ -433,6 +437,8 @@ def get_hand_state(rgb, hands, seg_mask, thresh, w, h):
         "handedness":     handedness_label,
         "is_peace":       is_peace,
         "pinch_dist":     pinch_dist,
+        "wrist_norm":     (float(lm[0].x), float(lm[0].y)),
+        "index_mcp_norm": (float(lm[5].x), float(lm[5].y)),
     })
     return state
 

@@ -164,6 +164,14 @@ RIGHT_SIDE_FRONT_RENDER_ORDER = [
 # ── Gesture / interaction constants ──────────────────────────────────────
 BRUSH_RADIUS_MIN = 20
 BRUSH_RADIUS_MAX = 300
+
+# Finish button geometry (top-right corner of OUTPUT canvas)
+_RESTART_MARGIN  = 30    # px from top and right edges
+_RESTART_W       = 220   # button width  (px, output coords)
+_RESTART_H       = 90    # button height (px, output coords)
+_RESTART_CORNER  = 18    # rounded corner radius
+_RESTART_OUTLINE = 5     # outline thickness
+_RESTART_FRAMES  = 50    # frames to dwell before triggering finish
 # Active hand: 'Left', 'Right', or None (= accept either)
 # Swirl CCW → toggle to other hand; swirl CW → same
 # (We store the mirrored label that matches what arrives from MediaPipe
@@ -2205,6 +2213,31 @@ def run_hand_brush_drag_arap_loop_skeleton(
                   f"at ({_bs_overlay_x},{_bs_overlay_y}), "
                   f"person_height={_person_out_px:.0f}px")
 
+    # ── Finish button + auto-return state ───────────────────────────────
+    _restart_frames     = 0   # hover frame counter for finish button
+    _no_detect_frames   = 0   # consecutive frames with no person detected
+    _NO_DETECT_LIMIT    = 10  # frames of no detection before auto-return
+
+    # Load finish button font once (avoid reloading every frame)
+    from PIL import ImageFont as _FF2
+    _FBOLD2 = [
+        'C:/Windows/Fonts/segoeuisb.ttf',
+        'C:/Windows/Fonts/segoeuib.ttf',
+        'C:/Windows/Fonts/calibrib.ttf',
+        'C:/Windows/Fonts/arialbd.ttf',
+    ]
+    _finish_font = None
+    for _fp2 in _FBOLD2:
+        if os.path.exists(_fp2):
+            try: _finish_font = _FF2.truetype(_fp2, 36); break
+            except: pass
+    if _finish_font is None: _finish_font = _FF2.load_default()
+    # Button rect in OUTPUT coords (top-right corner)
+    _rbx0 = OUTPUT_W - _RESTART_MARGIN - _RESTART_W
+    _rbx1 = OUTPUT_W - _RESTART_MARGIN
+    _rby0 = _RESTART_MARGIN
+    _rby1 = _RESTART_MARGIN + _RESTART_H
+
     while True:
         # Read mutable brush radius from state (updated by pinch gesture)
         brush_radius = interaction_state.get('brush_radius', brush_radius)
@@ -2232,6 +2265,17 @@ def run_hand_brush_drag_arap_loop_skeleton(
             cur_pts  = None
             hand_state = {"center":None,"is_open":False,"is_fist":False,
                           "over_body":False,"detected":False,"handedness":None}
+
+        # ── Auto-return if person disappears for too long ─────────────────
+        # cur_pts is None when pose is lost; seg_mask near-zero when no body
+        _person_visible = (cur_pts is not None)
+        if _person_visible:
+            _no_detect_frames = 0
+        else:
+            _no_detect_frames += 1
+            if _no_detect_frames >= _NO_DETECT_LIMIT:
+                print(f"No person detected for {_NO_DETECT_LIMIT} frames — returning to welcome screen")
+                return "restart"
 
         # Fix 1+2: vectorized mesh with caching
         V_track = None; frames = None
@@ -2262,6 +2306,21 @@ def run_hand_brush_drag_arap_loop_skeleton(
         if hand_handedness_raw == "Left":     hand_handedness = "Right"
         elif hand_handedness_raw == "Right":  hand_handedness = "Left"
         else:                                  hand_handedness = None
+
+        # ── Restart button pointer (wrist→MCP projection, output coords) ─
+        _restart_tip_out = None
+        if hand_detected and result is not None:
+            _raw_hand = result[3]   # hand_state dict from inference thread
+            # The inference thread's hand_state doesn't expose raw landmarks,
+            # so we use hand_center as the wrist proxy and compute direction
+            # from hand_center → (hand_center offset by extended_count heuristic).
+            # Simpler and still stable: use the pinch_dist to infer pointing.
+            # Actually: just use hand_center directly scaled to output coords —
+            # for the restart button (corner target) this is accurate enough.
+            if hand_center is not None:
+                _rx = int(hand_center[0] * OUTPUT_W / w)
+                _ry = int(hand_center[1] * OUTPUT_H / h)
+                _restart_tip_out = (_rx, _ry)
 
         # ── Active hand filter ───────────────────────────────────────────
         active_hand  = interaction_state.get("active_hand", None)
@@ -2505,6 +2564,55 @@ def run_hand_brush_drag_arap_loop_skeleton(
                     a * bgr + (1.0 - a) * roi.astype(np.float32), 0, 255
                 ).astype(np.uint8)
 
+        # ── Restart button ───────────────────────────────────────────────
+        _hovering_restart = (
+            _restart_tip_out is not None and
+            _rbx0 <= _restart_tip_out[0] <= _rbx1 and
+            _rby0 <= _restart_tip_out[1] <= _rby1
+        )
+        if _hovering_restart:
+            _restart_frames = min(_RESTART_FRAMES, _restart_frames + 1)
+        else:
+            _restart_frames = max(0, _restart_frames - 4)  # drain fast
+
+        _restart_frac = _restart_frames / _RESTART_FRAMES
+
+        # ── Finish button fill + outline ─────────────────────────────────
+        if _restart_frac > 0:
+            _rb_ov = vis_display.copy()
+            cv2.rectangle(_rb_ov, (_rbx0, _rby0), (_rbx1, _rby1),
+                          (255, 255, 255), -1)
+            cv2.addWeighted(_rb_ov, _restart_frac * 0.85,
+                            vis_display, 1.0 - _restart_frac * 0.85,
+                            0, vis_display)
+        # Rounded-corner outline drawn with PIL (cv2.rectangle is square)
+        from PIL import Image as _FI, ImageDraw as _FD
+        _fimg = _FI.fromarray(cv2.cvtColor(vis_display, cv2.COLOR_BGR2RGB)).convert('RGBA')
+        _fdraw = _FD.Draw(_fimg)
+        _fdraw.rounded_rectangle(
+            [_rbx0, _rby0, _rbx1, _rby1],
+            radius=_RESTART_CORNER,
+            fill=None,
+            outline=(255, 255, 255, 230),
+            width=_RESTART_OUTLINE,
+        )
+        # PIL label — uses font cached at loop init
+        _ffont = _finish_font
+        _lbl = 'Finish'
+        _lbb = _fdraw.textbbox((0, 0), _lbl, font=_ffont)
+        _ltw, _lth = _lbb[2]-_lbb[0], _lbb[3]-_lbb[1]
+        _lx = _rbx0 + (_RESTART_W - _ltw) // 2
+        _ly = _rby0 + (_RESTART_H - _lth) // 2
+        _lbl_col = (0, 0, 0, 255) if _restart_frac > 0.5 else (255, 255, 255, 255)
+        _fdraw.text((_lx + 2, _ly + 2), _lbl, font=_ffont, fill=(0, 0, 0, 180))
+        _fdraw.text((_lx, _ly), _lbl, font=_ffont, fill=_lbl_col)
+        vis_display = cv2.cvtColor(np.array(_fimg.convert('RGB')), cv2.COLOR_RGB2BGR)
+
+        # Trigger restart when fully filled
+        if _restart_frames >= _RESTART_FRAMES:
+            print("Finish triggered — returning to welcome screen")
+            return "restart"
+
         cv2.imshow(window_name, vis_display)
 
         if show_mask:
@@ -2592,6 +2700,11 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
                                    min_detection_confidence=0.5, min_tracking_confidence=0.5) as hands, \
          mp_pose.Pose(static_image_mode=False, model_complexity=1, smooth_landmarks=False,
                       enable_segmentation=False, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+
+      while True:  # ── Outer restart loop ──────────────────────────────
+        # Reset gesture trackers on each restart
+        _peace_detector.reset()
+        _pinch_tracker.reset()
 
         # ── Welcome screen ───────────────────────────────────────────────
         show_welcome_screen(window_name, duration=WELCOME_SCREEN_DURATION)
@@ -2764,7 +2877,7 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
             inference_thread.stop(); cap.release(); cv2.destroyAllWindows(); return
 
         print("About to enter main skeleton loop")
-        run_hand_brush_drag_arap_loop_skeleton(
+        _loop_result = run_hand_brush_drag_arap_loop_skeleton(
             cap=cap, segmenter=segmenter, hands=hands, pose=pose,
             h=h, w=w, V_base=V_base, V_def=V_def, T=T,
             step=step, thresh=thresh, feather=feather, show_mask=show_mask,
@@ -2772,8 +2885,36 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
             arap_cache=arap_cache, inference_thread=inference_thread,
             window_name=window_name,
         )
-        print("Main skeleton loop returned")
+        print(f"Main skeleton loop returned: {_loop_result}")
         inference_thread.stop()
+
+        if _loop_result != "restart":
+            break  # normal quit (q key) — exit outer loop
+
+        # Restart — reset interaction state for next session
+        print("Restarting session...")
+        brush_radius = max(45, int(min(w, h) * 0.07))
+        interaction_state.update({
+            "preview_vertices":  np.zeros(len(V_def), dtype=bool),
+            "preview_triangles": np.zeros(len(T),     dtype=bool),
+            "drag_vertices":     np.zeros(len(V_def), dtype=bool),
+            "drag_triangles":    np.zeros(len(T),     dtype=bool),
+            "dragging": False, "prev_hand_center": None, "hand_was_open": False,
+            "pose_prev_pts": None, "pose_last_good_pts": None,
+            "pose_missing_count": 0,
+            "binding": None, "yaw_side_state": "frontal",
+            "yaw_sign_value_smooth": 0.0, "bg_plate": None,
+            "cached_frame_arrays": None, "cached_frames": None,
+            "warp_min_area": 4.0, "active_hand": None,
+            "gesture_feedback_frames": 0, "gesture_feedback_msg": "",
+            "brush_radius": brush_radius,
+        })
+        # V_base/T/arap_cache will be rebuilt during next init
+        V_base, T, _, _ = TMh.build_grid_mesh(w, h, step=step)
+        V_def = V_base.copy().astype(np.float32)
+        E = TMh.build_unique_edges(T)
+        arap_cache = {"E": E, "neighbors": TMh.build_vertex_neighbors(len(V_base), E)}
+        # continue → loops back to welcome screen
 
     cap.release()
     cv2.destroyAllWindows()
