@@ -53,6 +53,10 @@ ANIM_BG_SPEED = 0.3
 # to step out of frame for ~5 seconds before the session starts.
 CAPTURE_BACKGROUND_BEFORE_INIT = True
 
+# Set by the selection screen — holds the name of the chosen image
+# (e.g. 'MBS_2' or 'FBS_3').  Empty string means nothing was chosen.
+current_beauty_standard = ""
+
 POSE_IDS = {
     "nose": 0,
     "left_ear": 7,
@@ -1705,6 +1709,385 @@ def show_welcome_screen(window_name, duration=WELCOME_SCREEN_DURATION):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BEAUTY STANDARD SELECTION SCREEN
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Grid constants (match the preview geometry)
+_SEL_MARGIN_X    = 60
+_SEL_MARGIN_Y_TOP = 40
+_SEL_MARGIN_Y_BOT = 60
+_SEL_GAP_X       = 28
+_SEL_GAP_Y       = 28
+_SEL_COLS        = 2
+_SEL_ROWS        = 3
+_SEL_CORNER_R    = 22
+_SEL_OUTLINE     = 6
+
+# Column 0 = MBS, Column 1 = FBS  (row 0..2)
+_SEL_NAMES = [
+    ["MBS_1", "FBS_1"],
+    ["MBS_2", "FBS_2"],
+    ["MBS_3", "FBS_3"],
+]
+
+_BS_IMAGE_DIR = "beauty_standard_images"
+
+
+def _load_bs_thumbnails(cell_w, cell_h):
+    """
+    Load and resize each beauty-standard image to fit inside cell_w × cell_h
+    (preserving aspect ratio, centred).
+    Returns a 2-D list matching _SEL_NAMES, each entry a PIL RGBA Image or None.
+    """
+    from PIL import Image as PILImage
+    thumbs = []
+    for row in range(_SEL_ROWS):
+        row_imgs = []
+        for col in range(_SEL_COLS):
+            name = _SEL_NAMES[row][col]
+            fpath = os.path.join(_BS_IMAGE_DIR, f"{name}.png")
+            if not os.path.exists(fpath):
+                row_imgs.append(None)
+                print(f"WARNING: beauty standard image not found: {fpath}")
+                continue
+            img = PILImage.open(fpath).convert("RGBA")
+            # Scale to fit cell while preserving aspect ratio
+            img_w, img_h = img.size
+            scale = min((cell_w - _SEL_OUTLINE*2) / img_w,
+                        (cell_h - _SEL_OUTLINE*2) / img_h)
+            new_w = max(1, int(img_w * scale))
+            new_h = max(1, int(img_h * scale))
+            img   = img.resize((new_w, new_h), PILImage.LANCZOS)
+            row_imgs.append(img)
+        thumbs.append(row_imgs)
+    return thumbs
+
+
+def _cell_rect(row, col, grid_top, grid_left, cell_w, cell_h):
+    """Return (x0, y0, x1, y1) for a grid cell."""
+    x0 = grid_left + col * (cell_w + _SEL_GAP_X)
+    y0 = grid_top  + row * (cell_h + _SEL_GAP_Y)
+    return x0, y0, x0 + cell_w, y0 + cell_h
+
+
+# How long the index finger must hover over a cell to select it (seconds).
+_SEL_HOVER_FRAMES = 50    # frames hand must point at cell to select
+
+
+def _get_index_tip_norm(hand_results, project=2.5):
+    """
+    Return a pointer position in normalised [0,1] coords derived from the
+    hand's overall pointing direction — more stable than fingertip tracking.
+
+    Direction vector: wrist (lm[0]) → index MCP (lm[5]).
+    This is the coarse pointing axis of the whole hand, which jitters much
+    less than the fingertip.  We start from the index MCP and project
+    `project` times the wrist-to-MCP distance forward along that axis.
+
+    project=2.5  means the cursor lands ~2.5 hand-lengths ahead of the MCP,
+    which feels natural for pointing at a screen from arm's length.
+    Increase to reach further; decrease to stay closer to the hand.
+    """
+    if not hand_results.multi_hand_landmarks:
+        return None, None
+    lm = hand_results.multi_hand_landmarks[0].landmark
+    # Wrist → index MCP = coarse hand pointing axis
+    wx,  wy  = lm[0].x, lm[0].y   # wrist
+    mx,  my  = lm[5].x, lm[5].y   # index MCP (knuckle)
+    dx = mx - wx
+    dy = my - wy
+    # Project forward from the MCP along the same axis
+    px = mx + project * dx
+    py = my + project * dy
+    return float(np.clip(px, 0.0, 1.0)), float(np.clip(py, 0.0, 1.0))
+
+
+def _make_selection_frame(bg_base, t, out_w, out_h,
+                           font_hdr, thumbnails,
+                           grid_top, grid_left, cell_w, cell_h,
+                           hover_fill,
+                           tip_px=None):
+    """
+    Render one frame of the beauty-standard selection screen.
+
+    hover_fill : dict mapping (row,col) -> float in [0,1]
+                 0 = transparent, 1 = fully white (triggers selection)
+    tip_px     : (x,y) pixel position of index fingertip, or None
+    """
+    from PIL import Image as PILImage, ImageDraw
+
+    H, W = out_h, out_w
+
+    # Shimmer
+    xs = np.linspace(0.0, 1.0, W, dtype=np.float32)
+    ys = np.linspace(0.0, 1.0, H, dtype=np.float32)
+    xv, yv = np.meshgrid(xs, ys)
+    d     = 0.5 * (xv + yv)
+    speed = 0.18
+    phase = np.pi * (d - (t * speed) % 1.0)
+    alpha_sh = (np.sin(phase) ** 2) * 0.28
+    shimmer_bgr = np.array([180.0, 50.0, 170.0], dtype=np.float32)
+    shimmer = (alpha_sh[:, :, None] * shimmer_bgr[None, None, :]).astype(np.float32)
+    frame_bgr = np.clip(bg_base.astype(np.float32) + shimmer, 0, 255).astype(np.uint8)
+
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    canvas = PILImage.fromarray(frame_rgb).convert("RGBA")
+    draw   = ImageDraw.Draw(canvas)
+
+    # ── Header ───────────────────────────────────────────────────────────────
+    header = "Please choose the beauty standard you would like to emulate"
+    try:
+        bb = draw.textbbox((0, 0), header, font=font_hdr)
+        tw = bb[2] - bb[0]
+    except AttributeError:
+        tw, _ = draw.textsize(header, font=font_hdr)
+    hx = (W - tw) // 2
+    hy = _SEL_MARGIN_X
+    draw.text((hx + 2, hy + 2), header, font=font_hdr, fill=(0, 0, 0, 200))
+    draw.text((hx,     hy    ), header, font=font_hdr, fill=(255, 255, 255, 255))
+
+    # ── Grid cells ────────────────────────────────────────────────────────────
+    overlay = PILImage.new("RGBA", (W, H), (0, 0, 0, 0))
+    odraw   = ImageDraw.Draw(overlay)
+
+    for row in range(_SEL_ROWS):
+        for col in range(_SEL_COLS):
+            x0, y0, x1, y1 = _cell_rect(row, col, grid_top, grid_left,
+                                          cell_w, cell_h)
+            fill_frac = hover_fill.get((row, col), 0.0)  # 0..1
+
+            # Fill alpha: 12 at rest → 255 when fully hovered
+            fill_a   = int(12 + fill_frac * 243)
+            # Outline thickens and warms slightly as hover grows
+            out_a    = int(200 + fill_frac * 55)
+            out_w_px = _SEL_OUTLINE + int(fill_frac * 4)
+
+            odraw.rounded_rectangle(
+                [x0, y0, x1, y1],
+                radius=_SEL_CORNER_R,
+                fill=(255, 255, 255, fill_a),
+                outline=(255, 255, int(200 + fill_frac * 55), out_a),
+                width=out_w_px,
+            )
+
+            # Paste thumbnail
+            thumb = thumbnails[row][col]
+            if thumb is not None:
+                tw_i, th_i = thumb.size
+                px = x0 + (cell_w - tw_i) // 2
+                py = y0 + (cell_h - th_i) // 2
+                canvas.paste(thumb,
+                             (max(px, x0 + _SEL_OUTLINE),
+                              max(py, y0 + _SEL_OUTLINE)),
+                             mask=thumb)
+
+    canvas = PILImage.alpha_composite(canvas, overlay)
+
+    # ── Index finger dot ──────────────────────────────────────────────────────
+    result_bgr = cv2.cvtColor(np.array(canvas.convert("RGB")), cv2.COLOR_RGB2BGR)
+    if tip_px is not None:
+        tx, ty = tip_px
+        cv2.circle(result_bgr, (tx, ty), 18, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(result_bgr, (tx, ty), 18, (180, 180, 255),  2, cv2.LINE_AA)
+
+    return result_bgr
+
+
+def show_selection_screen(window_name, bg_base, cap):
+    """
+    Display the beauty-standard selection screen.
+
+    Interaction:
+      HAND: point index finger at a rectangle.  The cell fills white over
+            _SEL_HOVER_FRAMES frames.  When fully filled the screen exits
+            and returns the selected name.
+      KEYBOARD fallback: keys 1-6 select immediately (1-3 = MBS, 4-6 = FBS).
+      q / Esc: skip, returns None.
+
+    Sets the module-level current_beauty_standard string.
+    Returns the selected name stem (e.g. 'MBS_2') or None.
+    """
+    global current_beauty_standard
+
+    from PIL import ImageFont as PILFont, Image as _PI3, ImageDraw as _ID3
+
+    out_w, out_h = OUTPUT_W, OUTPUT_H
+    usable_w = out_w - 2 * _SEL_MARGIN_X
+
+    # ── Header font ───────────────────────────────────────────────────────────
+    BOLD_PATHS = [
+        "C:/Windows/Fonts/segoeuisb.ttf",
+        "C:/Windows/Fonts/segoeuib.ttf",
+        "C:/Windows/Fonts/calibrib.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ]
+    header_text = "Please choose the beauty standard you would like to emulate"
+    font_hdr = None
+    for fpath in BOLD_PATHS:
+        if not os.path.exists(fpath):
+            continue
+        for sz in range(52, 14, -1):
+            try:
+                f  = PILFont.truetype(fpath, sz)
+                _d = _ID3.Draw(_PI3.new("RGB", (1, 1)))
+                bb = _d.textbbox((0, 0), header_text, font=f)
+                if (bb[2] - bb[0]) <= usable_w:
+                    font_hdr = f
+                    break
+            except Exception:
+                continue
+        if font_hdr is not None:
+            break
+    if font_hdr is None:
+        font_hdr = PILFont.load_default()
+
+    # ── Grid geometry ─────────────────────────────────────────────────────────
+    _dd = _ID3.Draw(_PI3.new("RGB", (1, 1)))
+    try:
+        hdr_bb = _dd.textbbox((0, 0), header_text, font=font_hdr)
+        hdr_h  = hdr_bb[3] - hdr_bb[1]
+    except AttributeError:
+        _, hdr_h = _dd.textsize(header_text, font=font_hdr)
+
+    grid_top  = _SEL_MARGIN_X + hdr_h + _SEL_MARGIN_Y_TOP
+    grid_left = _SEL_MARGIN_X
+    grid_w    = out_w - 2 * _SEL_MARGIN_X
+    grid_h    = out_h - _SEL_MARGIN_Y_BOT - grid_top
+    cell_w    = (grid_w - _SEL_GAP_X * (_SEL_COLS - 1)) // _SEL_COLS
+    cell_h    = (grid_h - _SEL_GAP_Y * (_SEL_ROWS - 1)) // _SEL_ROWS
+
+    thumbnails = _load_bs_thumbnails(cell_w, cell_h)
+
+    # ── Keyboard fallback map ─────────────────────────────────────────────────
+    key_to_cell = {
+        ord('1'): (0,0), ord('2'): (1,0), ord('3'): (2,0),
+        ord('4'): (0,1), ord('5'): (1,1), ord('6'): (2,1),
+    }
+
+    # ── Per-cell hover dwell state ────────────────────────────────────────────
+    hover_fill   = {(r, c): 0.0 for r in range(_SEL_ROWS) for c in range(_SEL_COLS)}
+    hover_frames = {(r, c): 0   for r in range(_SEL_ROWS) for c in range(_SEL_COLS)}
+    DRAIN_SPEED  = 8   # frame-counts drained per frame when not hovering
+
+    # ── Open a lightweight hands session just for this screen ─────────────────
+    with mp.solutions.hands.Hands(
+        static_image_mode=False,
+        max_num_hands=1,
+        model_complexity=0,
+        min_detection_confidence=0.6,
+        min_tracking_confidence=0.5,
+    ) as hands_sel:
+
+        start  = time.time()
+        result = None
+
+        # Smoothed pointer position in normalised coords (exponential smoothing)
+        smooth_nx, smooth_ny = None, None
+        SMOOTH_ALPHA = 0.35   # lower = smoother but more lag; 0.35 is a good balance
+
+        # Render throttle — only rebuild the PIL frame every RENDER_EVERY inferences.
+        # Inference + camera read ~25ms, PIL render ~100ms.  By rendering every 4th
+        # inference frame we run at ~camera speed instead of ~PIL speed.
+        RENDER_EVERY   = 4
+        infer_count    = 0
+        cached_frame   = None   # last rendered PIL→BGR frame
+
+        while result is None:
+            # ── Camera: grab several times to flush buffer, then decode once ───
+            # grab() is ~0.1ms (no decode); clears queued frames so we always
+            # get the latest one from the sensor.
+            for _ in range(3):
+                cap.grab()
+            ok, fr = cap.read()
+            if not ok:
+                break
+            fr  = rotate_frame(fr)
+            if fr.shape[:2] != (out_h, out_w):
+                fr = cv2.resize(fr, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+            fr  = cv2.flip(fr, 1)
+            rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+
+            # ── Inference (every frame — cheap at model_complexity=0) ─────────
+            hand_res       = hands_sel.process(rgb)
+            raw_nx, raw_ny = _get_index_tip_norm(hand_res)
+            infer_count   += 1
+
+            # ── Smooth pointer in normalised space ────────────────────────────
+            if raw_nx is not None:
+                if smooth_nx is None:
+                    smooth_nx, smooth_ny = raw_nx, raw_ny
+                else:
+                    smooth_nx = SMOOTH_ALPHA * raw_nx + (1 - SMOOTH_ALPHA) * smooth_nx
+                    smooth_ny = SMOOTH_ALPHA * raw_ny + (1 - SMOOTH_ALPHA) * smooth_ny
+            else:
+                # Hand lost — decay slowly toward last position, then drop
+                smooth_nx = smooth_ny = None
+
+            # Convert smoothed normalised → output pixel coords
+            tip_px = None
+            if smooth_nx is not None:
+                tip_px = (int(smooth_nx * out_w), int(smooth_ny * out_h))
+
+            # ── Update hover fill (every inference frame) ─────────────────────
+            hovered_cell = None
+            if tip_px is not None:
+                tx, ty = tip_px
+                for row in range(_SEL_ROWS):
+                    for col in range(_SEL_COLS):
+                        x0, y0, x1, y1 = _cell_rect(row, col, grid_top,
+                                                      grid_left, cell_w, cell_h)
+                        if x0 <= tx <= x1 and y0 <= ty <= y1:
+                            hovered_cell = (row, col)
+                            break
+                    if hovered_cell:
+                        break
+
+            for cell in list(hover_fill.keys()):
+                if cell == hovered_cell:
+                    hover_frames[cell] = min(_SEL_HOVER_FRAMES,
+                                             hover_frames[cell] + 1)
+                    hover_fill[cell]   = hover_frames[cell] / _SEL_HOVER_FRAMES
+                    if hover_frames[cell] >= _SEL_HOVER_FRAMES:
+                        result = _SEL_NAMES[cell[0]][cell[1]]
+                else:
+                    hover_frames[cell] = max(0, hover_frames[cell] - DRAIN_SPEED)
+                    hover_fill[cell]   = hover_frames[cell] / _SEL_HOVER_FRAMES
+
+            # ── Render only every RENDER_EVERY frames ─────────────────────────
+            # PIL compositing is the bottleneck (~100ms). Inference is ~25ms.
+            # We always show the cached frame between renders so the window
+            # stays responsive; hover state still updates every inference frame.
+            if infer_count % RENDER_EVERY == 0 or cached_frame is None:
+                t = time.time() - start
+                cached_frame = _make_selection_frame(
+                    bg_base, t, out_w, out_h,
+                    font_hdr, thumbnails,
+                    grid_top, grid_left, cell_w, cell_h,
+                    hover_fill=hover_fill,
+                    tip_px=tip_px,
+                )
+
+            cv2.imshow(window_name, cached_frame)
+            key = cv2.waitKey(1) & 0xFF   # 1ms — don't add artificial delay
+
+            # Keyboard fallback
+            if key in key_to_cell:
+                result = _SEL_NAMES[key_to_cell[key][0]][key_to_cell[key][1]]
+            if key in (ord('q'), 27):
+                result = "__skip__"
+                break
+
+    if result == "__skip__" or result is None:
+        current_beauty_standard = ""
+        return None
+
+    current_beauty_standard = result
+    print(f"Beauty standard selected: {result}")
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2084,8 +2467,25 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
          mp_pose.Pose(static_image_mode=False, model_complexity=1, smooth_landmarks=False,
                       enable_segmentation=False, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
 
-        # ── Welcome screen — runs once before anything else ─────────────
+        # ── Welcome screen ───────────────────────────────────────────────
         show_welcome_screen(window_name, duration=WELCOME_SCREEN_DURATION)
+
+        # ── Load welcome background for reuse on selection screen ────────
+        _sel_bg = cv2.imread(WELCOME_BG_PATH)
+        if _sel_bg is None:
+            _sel_bg = np.zeros((OUTPUT_H, OUTPUT_W, 3), dtype=np.uint8)
+            _sel_bg[:, :] = (60, 20, 10)
+        else:
+            _sel_bg = cv2.resize(_sel_bg, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
+
+        # ── Beauty standard selection screen ─────────────────────────────
+        selected_bs = show_selection_screen(window_name, _sel_bg, cap)
+        if selected_bs is not None:
+            print(f"Selected beauty standard: {selected_bs}")
+            interaction_state["selected_beauty_standard"] = selected_bs
+        else:
+            print("Beauty standard selection skipped.")
+            interaction_state["selected_beauty_standard"] = None
 
         inference_thread = PoseInferenceThread(pose=pose, hands=hands, segmenter=segmenter,
                                                 feather=feather, thresh=thresh, w=w, h=h)
