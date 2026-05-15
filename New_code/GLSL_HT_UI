@@ -6,9 +6,8 @@ import time
 
 ROTATE_DEG = 90                
 ROTATE_DIR = "ccw"              # "ccw" or "cw"
-
-OUTPUT_W = 1080
-OUTPUT_H = 1920
+OUTPUT_W = 2160
+OUTPUT_H = 3840
 
 PRIMARY_MONITOR_WIDTH = 1920 
 WINDOW_NAME = "Warped Mirror"

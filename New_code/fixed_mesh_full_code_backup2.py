@@ -17,7 +17,7 @@ _pinch_tracker  = PTh.PinchGestureTracker()
 import Loop_helpers as Lh
 import Display_helpres as Dh
 
-ROTATE_DEG = 90
+ROTATE_DEG = 270
 ROTATE_DIR = "ccw"
 
 OUTPUT_W = 1080
@@ -51,7 +51,7 @@ ANIM_BG_SPEED = 0.3
 # Set to False to skip background capture and go straight to pose init.
 # Background capture improves hole-fill quality but requires the person
 # to step out of frame for ~5 seconds before the session starts.
-CAPTURE_BACKGROUND_BEFORE_INIT = True
+CAPTURE_BACKGROUND_BEFORE_INIT = False
 
 # Set by the selection screen — holds the name of the chosen image
 # (e.g. 'MBS_2' or 'FBS_3').  Empty string means nothing was chosen.
