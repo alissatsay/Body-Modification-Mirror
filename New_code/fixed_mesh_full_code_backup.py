@@ -17,7 +17,7 @@ _pinch_tracker  = PTh.PinchGestureTracker()
 import Loop_helpers as Lh
 import Display_helpres as Dh
 
-ROTATE_DEG = 90
+ROTATE_DEG = 270
 ROTATE_DIR = "ccw"
 
 OUTPUT_W = 1080
@@ -39,8 +39,6 @@ WELCOME_BG_PATH = "welcome_background.png"
 USE_ANIMATED_BACKGROUND = False
 
 # Two BGR colours the gradient moves between.
-# Examples: deep purple (50,0,80) -> warm rose (40,60,200)
-#           navy (80,20,10) -> teal (120,100,20)
 ANIM_BG_COLOR_A = (80,  10,  30)   # BGR — left/top colour
 ANIM_BG_COLOR_B = (20, 100, 180)   # BGR — right/bottom colour
 
@@ -48,10 +46,7 @@ ANIM_BG_COLOR_B = (20, 100, 180)   # BGR — right/bottom colour
 ANIM_BG_SPEED = 0.3
 
 # Set to True to capture a clean background plate before initialization.
-# Set to False to skip background capture and go straight to pose init.
-# Background capture improves hole-fill quality but requires the person
-# to step out of frame for ~5 seconds before the session starts.
-CAPTURE_BACKGROUND_BEFORE_INIT = True
+CAPTURE_BACKGROUND_BEFORE_INIT = False
 
 # Set by the selection screen — holds the name of the chosen image
 # (e.g. 'MBS_2' or 'FBS_3').  Empty string means nothing was chosen.
@@ -164,15 +159,26 @@ RIGHT_SIDE_FRONT_RENDER_ORDER = [
 # ── Gesture / interaction constants ──────────────────────────────────────
 BRUSH_RADIUS_MIN = 20
 BRUSH_RADIUS_MAX = 300
-# Active hand: 'Left', 'Right', or None (= accept either)
-# Swirl CCW → toggle to other hand; swirl CW → same
-# (We store the mirrored label that matches what arrives from MediaPipe
-#  after the left/right swap done in the main loop.)
+
+# Finish button geometry (top-right corner of OUTPUT canvas)
+_RESTART_MARGIN  = 30    # px from top and right edges
+_RESTART_W       = 220   # button width  (px, output coords)
+_RESTART_H       = 90    # button height (px, output coords)
+_RESTART_CORNER  = 18    # rounded corner radius
+_RESTART_OUTLINE = 5     # outline thickness
+_RESTART_FRAMES  = 50    # frames to dwell before triggering finish
 
 LEG_OVERLAP_TRIGGER_FRAC = 0.015
 LEG_FRONT_SCORE_DEADBAND = 8.0
 ARM_OVERLAP_TRIGGER_FRAC = 0.020
 ARM_FRONT_SCORE_DEADBAND = 6.0
+
+# ── Beauty-standard image directory ──────────────────────────────────────
+_BS_IMAGE_DIR = "beauty_standard_images"
+
+# ── Initialization pose image ─────────────────────────────────────────────
+_INIT_POSE_PATH = os.path.join("UI_gestures", "initialization_pose.png")
+_INIT_POSE_ALPHA = 0.35   # same opacity as BS overlay
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -187,70 +193,37 @@ def build_adaptive_body_mesh(
     contour_inset=3,
     min_contour_pts=80,
 ):
-    """
-    Build a body-conforming triangle mesh using Delaunay triangulation.
-
-    Strategy:
-      1. Sample points densely along the body contour  — drives boundary quality
-      2. Sample points on a coarse grid inside the body — drives interior coverage
-      3. Add frame corner/edge points                   — keeps mesh well-conditioned
-      4. Delaunay triangulate all points together
-      5. Classify triangles as active (centroid inside body) or inactive
-
-    Parameters
-    ----------
-    w, h            : frame width and height
-    body_mask       : float32 (H, W) in [0,1], from finalize_init_mask
-    interior_step   : grid spacing inside body (px). Use 50-80 for speed — interior
-                      triangles don't need to be small; the warp is smooth there.
-    contour_step    : sample every Nth contour pixel. 8-12 gives good boundary quality.
-    contour_inset   : pull contour points slightly inward (px) so centroids land inside
-    min_contour_pts : floor on contour sample count regardless of contour_step
-
-    Returns
-    -------
-    V      : (N, 2) float32 vertex positions
-    T      : (M, 3) int32  triangle indices
-    active : (M,)   bool   True where triangle centroid is inside body
-    """
     H, W = h, w
     mask_u8 = (body_mask >= 0.5).astype(np.uint8)
 
-    # ── 1. Contour points ────────────────────────────────────────────────────
     contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
     contour_pts = []
     if contours:
         main_contour = max(contours, key=cv2.contourArea)
-        pts_raw = main_contour[:, 0, :].astype(np.float32)   # (N, 2) as (x, y)
+        pts_raw = main_contour[:, 0, :].astype(np.float32)
 
         n_contour = len(pts_raw)
-        # pick step so we get at least min_contour_pts samples
         step_px = max(1, min(contour_step, n_contour // max(min_contour_pts, 1)))
         sampled = pts_raw[::step_px]
 
-        # Inset toward centroid so the points land just inside the mask
         if contour_inset > 0 and len(sampled) >= 3:
             cx = float(np.mean(sampled[:, 0]))
             cy = float(np.mean(sampled[:, 1]))
             d = sampled - np.array([cx, cy], dtype=np.float32)
             norms = np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-6)
             sampled = sampled - contour_inset * (d / norms)
-            # Clamp to frame
             sampled[:, 0] = np.clip(sampled[:, 0], 0, W - 1)
             sampled[:, 1] = np.clip(sampled[:, 1], 0, H - 1)
 
         contour_pts = sampled.tolist()
 
-    # ── 2. Interior grid points (inside mask only) ───────────────────────────
     interior_pts = []
     for y in range(0, H, interior_step):
         for x in range(0, W, interior_step):
             if mask_u8[y, x] > 0:
                 interior_pts.append([float(x), float(y)])
 
-    # ── 3. Frame boundary points ─────────────────────────────────────────────
-    # Keeps the triangulation from having huge degenerate triangles at the edges
     frame_pts = []
     for x in range(0, W + 1, interior_step):
         xc = float(min(x, W - 1))
@@ -259,15 +232,12 @@ def build_adaptive_body_mesh(
     for y in range(interior_step, H, interior_step):
         frame_pts.append([0.0, float(y)])
         frame_pts.append([float(W - 1), float(y)])
-    # Always include the four corners
     frame_pts += [[0.0, 0.0], [float(W-1), 0.0],
                   [0.0, float(H-1)], [float(W-1), float(H-1)]]
 
-    # ── 4. Combine & deduplicate within 2 px ────────────────────────────────
     all_pts = np.array(contour_pts + interior_pts + frame_pts, dtype=np.float32)
 
     if len(all_pts) < 3:
-        # Fallback: uniform grid
         print("build_adaptive_body_mesh: not enough points, falling back to grid")
         V_fb, T_fb, _, _ = TMh.build_grid_mesh(w, h, step=interior_step)
         active_fb = np.ones(len(T_fb), dtype=bool)
@@ -282,12 +252,10 @@ def build_adaptive_body_mesh(
         active_fb = np.ones(len(T_fb), dtype=bool)
         return V_fb.astype(np.float32), T_fb, active_fb
 
-    # ── 5. Delaunay triangulation ────────────────────────────────────────────
     tri = Delaunay(all_pts)
     T   = tri.simplices.astype(np.int32)
     V   = all_pts.astype(np.float32)
 
-    # ── 6. Classify triangles by centroid ───────────────────────────────────
     centroids = (V[T[:, 0]] + V[T[:, 1]] + V[T[:, 2]]) / 3.0
     cx = np.clip(np.round(centroids[:, 0]).astype(np.int32), 0, W - 1)
     cy = np.clip(np.round(centroids[:, 1]).astype(np.int32), 0, H - 1)
@@ -301,15 +269,10 @@ def build_adaptive_body_mesh(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FIX 4 — Background inference thread
+# BACKGROUND INFERENCE THREAD
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PoseInferenceThread:
-    """
-    Runs MediaPipe segmentation + pose + hands inference on a background thread.
-    The render loop reads .latest_result() without blocking.
-    """
-
     def __init__(self, pose, hands, segmenter, feather=0, thresh=0.5, w=640, h=480):
         self.pose      = pose
         self.hands     = hands
@@ -360,7 +323,7 @@ class PoseInferenceThread:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FIX 1 — Vectorized mesh reconstruction helpers
+# VECTORIZED MESH RECONSTRUCTION HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_frame_arrays(frames, seg_ids, num_vertices):
@@ -419,10 +382,6 @@ def update_local_offsets_vectorized(binding, frame_arrays, V_new):
     binding["vertex_local_uv_offset"][valid] = (uv_now - rest_uv)[valid]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FIX 2 — Frame array cache helper
-# ══════════════════════════════════════════════════════════════════════════════
-
 def frames_moved_enough(prev_frames, new_frames, threshold_px=1.5):
     if prev_frames is None:
         return True
@@ -435,7 +394,7 @@ def frames_moved_enough(prev_frames, new_frames, threshold_px=1.5):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Unchanged helpers
+# MISC HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def rotate_frame(frame_bgr, deg=ROTATE_DEG, direction=ROTATE_DIR):
@@ -477,15 +436,169 @@ def capture_background_plate(cap, h, w, n_frames=20, window_name="Background cap
         fr = cv2.flip(fr, 1)
         acc = fr.astype(np.float32) if acc is None else acc + fr.astype(np.float32)
         got += 1
-        vis = fr.copy()
-        cv2.putText(vis, f"Capturing empty background... {k+1}/{n_frames}",
-                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
-        cv2.imshow(window_name, cv2.resize(vis, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR))
+        vis_display = cv2.resize(fr, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
+        # ── CHANGE 1: no frame counter in countdown text ──────────────────
+        vis_display = _draw_countdown_text(
+            vis_display,
+            "Capturing background...",
+            OUTPUT_W, OUTPUT_H)
+        cv2.imshow(window_name, vis_display)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
     if acc is None or got == 0:
         return None
     return np.clip(acc / float(got), 0, 255).astype(np.uint8)
+
+
+def _draw_countdown_text(frame_bgr, text, out_w, out_h):
+    """
+    Render countdown / status text onto frame_bgr using PIL.
+    Returns a new BGR image.
+    """
+    from PIL import Image as _PILImg, ImageDraw as _PILDraw, ImageFont as _PILFont
+    BOLD_PATHS = [
+        "C:/Windows/Fonts/segoeuisb.ttf",
+        "C:/Windows/Fonts/segoeuib.ttf",
+        "C:/Windows/Fonts/calibrib.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ]
+    usable_w = out_w - 120
+    font = None
+    for fp in BOLD_PATHS:
+        if not os.path.exists(fp):
+            continue
+        for sz in range(72, 18, -1):
+            try:
+                f  = _PILFont.truetype(fp, sz)
+                _d = _PILDraw.Draw(_PILImg.new("RGB", (1, 1)))
+                bb = _d.textbbox((0, 0), text, font=f)
+                if (bb[2] - bb[0]) <= usable_w:
+                    font = f
+                    break
+            except Exception:
+                continue
+        if font:
+            break
+    if font is None:
+        font = _PILFont.load_default()
+
+    img  = _PILImg.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    draw = _PILDraw.Draw(img)
+    try:
+        bb = draw.textbbox((0, 0), text, font=font)
+        tw, th = bb[2] - bb[0], bb[3] - bb[1]
+    except AttributeError:
+        tw, th = draw.textsize(text, font=font)
+    x = (out_w - tw) // 2
+    y = (out_h - th) // 2
+    draw.text((x + 3, y + 3), text, font=font, fill=(0, 0, 0))
+    draw.text((x,     y    ), text, font=font, fill=(255, 255, 255))
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+
+def _draw_two_line_countdown_text(frame_bgr, line1, line2, out_w, out_h):
+    """
+    Render two lines of text centred on frame_bgr using PIL.
+    line1 is drawn above line2 with a small gap.
+    Returns a new BGR image.
+    """
+    from PIL import Image as _PILImg, ImageDraw as _PILDraw, ImageFont as _PILFont
+    BOLD_PATHS = [
+        "C:/Windows/Fonts/segoeuisb.ttf",
+        "C:/Windows/Fonts/segoeuib.ttf",
+        "C:/Windows/Fonts/calibrib.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ]
+    usable_w = out_w - 120
+
+    def _pick_font(text):
+        for fp in BOLD_PATHS:
+            if not os.path.exists(fp):
+                continue
+            for sz in range(72, 18, -1):
+                try:
+                    f  = _PILFont.truetype(fp, sz)
+                    _d = _PILDraw.Draw(_PILImg.new("RGB", (1, 1)))
+                    bb = _d.textbbox((0, 0), text, font=f)
+                    if (bb[2] - bb[0]) <= usable_w:
+                        return f
+                except Exception:
+                    continue
+        return _PILFont.load_default()
+
+    font1 = _pick_font(line1)
+    font2 = _pick_font(line2)
+
+    img  = _PILImg.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    draw = _PILDraw.Draw(img)
+
+    def _measure(text, font):
+        try:
+            bb = draw.textbbox((0, 0), text, font=font)
+            return bb[2] - bb[0], bb[3] - bb[1]
+        except AttributeError:
+            return draw.textsize(text, font=font)
+
+    tw1, th1 = _measure(line1, font1)
+    tw2, th2 = _measure(line2, font2)
+    gap = int(out_h * 0.015)
+    total_h = th1 + gap + th2
+
+    y1 = (out_h - total_h) // 2
+    y2 = y1 + th1 + gap
+
+    x1 = (out_w - tw1) // 2
+    x2 = (out_w - tw2) // 2
+
+    # line1 — instruction text, slightly smaller / lighter colour
+    draw.text((x1 + 3, y1 + 3), line1, font=font1, fill=(0, 0, 0))
+    draw.text((x1,     y1    ), line1, font=font1, fill=(220, 200, 255))
+
+    # line2 — countdown text, white
+    draw.text((x2 + 3, y2 + 3), line2, font=font2, fill=(0, 0, 0))
+    draw.text((x2,     y2    ), line2, font=font2, fill=(255, 255, 255))
+
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+
+def _composite_init_pose_overlay(canvas, init_pose_img, alpha=_INIT_POSE_ALPHA):
+    """
+    Composite init_pose_img onto canvas using the same logic as the BS overlay:
+    horizontally centred, bottom-aligned with a 60px margin, at `alpha` opacity.
+    init_pose_img may be 3-channel BGR or 4-channel BGRA.
+    """
+    if init_pose_img is None:
+        return canvas
+    oh_, ow = init_pose_img.shape[:2]
+    _BS_BOTTOM_MARGIN = 60
+    ox = (OUTPUT_W - ow) // 2
+    oy = OUTPUT_H - oh_ - _BS_BOTTOM_MARGIN
+
+    x0 = max(ox, 0);              y0 = max(oy, 0)
+    x1 = min(ox + ow, OUTPUT_W);  y1 = min(oy + oh_, OUTPUT_H)
+    sx0 = x0 - ox;  sy0 = y0 - oy
+    sx1 = sx0 + (x1 - x0);        sy1 = sy0 + (y1 - y0)
+
+    if x1 <= x0 or y1 <= y0:
+        return canvas
+
+    roi   = canvas[y0:y1, x0:x1]
+    patch = init_pose_img[sy0:sy1, sx0:sx1]
+
+    if patch.shape[2] == 4:
+        a   = patch[:, :, 3:4].astype(np.float32) / 255.0
+        a  *= alpha
+        bgr = patch[:, :, :3].astype(np.float32)
+    else:
+        a   = np.full((y1 - y0, x1 - x0, 1), alpha, dtype=np.float32)
+        bgr = patch.astype(np.float32)
+
+    canvas[y0:y1, x0:x1] = np.clip(
+        a * bgr + (1.0 - a) * roi.astype(np.float32), 0, 255
+    ).astype(np.uint8)
+    return canvas
 
 
 def show_countdown(cap, h, w, seconds, message, window_name,
@@ -500,19 +613,14 @@ def show_countdown(cap, h, w, seconds, message, window_name,
         if fr.shape[:2] != (h, w):
             fr = cv2.resize(fr, (w, h), interpolation=cv2.INTER_LINEAR)
         fr = cv2.flip(fr, 1)
-        elapsed = time.time() - start_time
+        elapsed   = time.time() - start_time
         remaining = int(np.ceil(seconds - elapsed))
         if remaining <= 0:
             break
-        vis = fr.copy()
-        text = f"{message} in {remaining}"
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
-        cv2.putText(vis, text, ((w - tw) // 2, h // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3, cv2.LINE_AA)
-        vis_display = cv2.resize(vis, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
-        if bs_img is not None:
-            oe = 0.0 if overlay_timer_start is None else time.time() - overlay_timer_start
-            vis_display = _draw_bs_timer_overlay(vis_display, bs_img, bs_size, bs_margin, oe, overlay_timer_duration)
+        # ── CHANGE 1: no frame counter ────────────────────────────────────
+        text        = f"{message} in {remaining}"
+        vis_display = cv2.resize(fr, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
+        vis_display = _draw_countdown_text(vis_display, text, OUTPUT_W, OUTPUT_H)
         cv2.imshow(window_name, vis_display)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -712,7 +820,7 @@ def compute_render_order_from_yaw(cur_pts, ref_metrics, interaction_state):
         if yaw_amount <= YAW_EXIT_THRESHOLD: state = "frontal"
         elif yaw_sign > 0 and yaw_amount >= YAW_ENTER_THRESHOLD: state = "left_front"
     interaction_state["yaw_side_state"] = state
-    if state == "left_front":   render_order = LEFT_SIDE_FRONT_RENDER_ORDER;  yaw_state_txt = "left side front"
+    if state == "left_front":    render_order = LEFT_SIDE_FRONT_RENDER_ORDER;  yaw_state_txt = "left side front"
     elif state == "right_front": render_order = RIGHT_SIDE_FRONT_RENDER_ORDER; yaw_state_txt = "right side front"
     else:                        render_order = FRONTAL_RENDER_ORDER;           yaw_state_txt = "frontal"
     yaw_debug["sign_value_smooth"] = float(sign_value_smooth)
@@ -998,7 +1106,6 @@ def warp_mesh_piecewise(src_img, V_src, V_dst, T, active_mask=None, dst_img=None
 
 
 def reconstruct_tracked_mesh_from_skeleton(binding, cur_pts, V_base):
-    """Original — kept for compatibility."""
     frames = build_segment_frames(cur_pts)
     if frames is None: return None, None
     V_track = V_base.copy().astype(np.float32)
@@ -1011,7 +1118,6 @@ def reconstruct_tracked_mesh_from_skeleton(binding, cur_pts, V_base):
 
 
 def reconstruct_deformed_mesh_from_skeleton(binding, cur_pts, V_base):
-    """Original — kept for compatibility."""
     frames = build_segment_frames(cur_pts)
     if frames is None: return None, None
     V_def = V_base.copy().astype(np.float32)
@@ -1407,7 +1513,6 @@ def bind_mesh_to_skeleton(V_base, T, ref_pts, init_seg_mask, mask_thresh=0.5):
 
 
 def update_local_offsets_from_world(binding, frames, V_new):
-    """Original — kept for compatibility."""
     seg_ids=binding["vertex_segment"]; rest_uv=binding["vertex_local_uv_rest"]; off_uv=binding["vertex_local_uv_offset"]
     for i in range(len(V_new)):
         si=seg_ids[i]
@@ -1446,7 +1551,6 @@ def finalize_init_mask(mask_accum, count, avg_thresh=0.30, dilate_ksize=11, clos
 
 
 def _resolve_beauty_standard_image_path(filename="beauty_standard.png"):
-    import os
     candidates = []
     if "__file__" in globals():
         candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1495,31 +1599,14 @@ def _draw_bs_timer_overlay(canvas, bs_img, size, margin, elapsed, duration):
 def make_gradient_background(h, w, t,
                               color_a=ANIM_BG_COLOR_A,
                               color_b=ANIM_BG_COLOR_B):
-    """
-    Generate a (h, w, 3) uint8 BGR frame of a diagonal gradient whose
-    phase sweeps over time.
-
-    t        : continuous time value (seconds * ANIM_BG_SPEED)
-    color_a  : BGR colour at the trailing edge of the gradient
-    color_b  : BGR colour at the leading edge
-
-    The gradient line runs at 45° (top-left → bottom-right).
-    d[y,x] = (x/w + y/h) / 2  puts 0 at top-left and 1 at bottom-right.
-    Adding t and wrapping with sin² makes it oscillate smoothly.
-    """
-    # Normalised diagonal coordinate for every pixel, shape (h, w)
     xs = np.linspace(0.0, 1.0, w, dtype=np.float32)
     ys = np.linspace(0.0, 1.0, h, dtype=np.float32)
-    xv, yv = np.meshgrid(xs, ys)          # (h, w) each
-    d = 0.5 * (xv + yv)                   # 0 at top-left, 1 at bottom-right
-
-    # Smooth oscillation: sin²( π*(d - t) ) gives a wave moving diagonally
+    xv, yv = np.meshgrid(xs, ys)
+    d = 0.5 * (xv + yv)
     phase = np.pi * (d - t % 1.0)
-    alpha = np.sin(phase) ** 2             # (h, w) in [0, 1]
-
-    # Interpolate between the two colours
-    a = np.array(color_a, dtype=np.float32)   # (3,)
-    b = np.array(color_b, dtype=np.float32)   # (3,)
+    alpha = np.sin(phase) ** 2
+    a = np.array(color_a, dtype=np.float32)
+    b = np.array(color_b, dtype=np.float32)
     frame = (alpha[:, :, None] * b[None, None, :] +
              (1.0 - alpha[:, :, None]) * a[None, None, :])
     return np.clip(frame, 0, 255).astype(np.uint8)
@@ -1530,31 +1617,24 @@ def make_gradient_background(h, w, t,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _load_welcome_fonts(out_w, out_h, margin=90):
-    """
-    Load PIL fonts at sizes that are guaranteed to fit within the usable
-    width (out_w - 2*margin) for each text block.
-
-    Priority list (Windows clean geometric sans-serif):
-      Segoe UI variants → Calibri → Arial → PIL built-in fallback
-    """
     from PIL import ImageFont, Image, ImageDraw
 
     usable_w = out_w - 2 * margin
 
     BOLD_PATHS = [
-        "C:/Windows/Fonts/segoeuisb.ttf",   # Segoe UI Semibold
-        "C:/Windows/Fonts/segoeuib.ttf",    # Segoe UI Bold
-        "C:/Windows/Fonts/calibrib.ttf",    # Calibri Bold
-        "C:/Windows/Fonts/arialbd.ttf",     # Arial Bold
+        "C:/Windows/Fonts/segoeuisb.ttf",
+        "C:/Windows/Fonts/segoeuib.ttf",
+        "C:/Windows/Fonts/calibrib.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
         "C:/Windows/Fonts/arial.ttf",
     ]
     REG_PATHS = [
-        "C:/Windows/Fonts/segoeui.ttf",     # Segoe UI Regular
+        "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/calibri.ttf",
         "C:/Windows/Fonts/arial.ttf",
     ]
     LIGHT_PATHS = [
-        "C:/Windows/Fonts/segoeuil.ttf",    # Segoe UI Light  ← most elegant
+        "C:/Windows/Fonts/segoeuil.ttf",
         "C:/Windows/Fonts/calibril.ttf",
         "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/arial.ttf",
@@ -1571,7 +1651,6 @@ def _load_welcome_fonts(out_w, out_h, margin=90):
     light_path = first_path(LIGHT_PATHS)
 
     def fit_font(text, path, start_size, min_size=20):
-        """Return a font whose rendered width fits within usable_w."""
         if path is None:
             return ImageFont.load_default()
         tmp_img  = Image.new("RGB", (1, 1))
@@ -1586,30 +1665,20 @@ def _load_welcome_fonts(out_w, out_h, margin=90):
                 continue
         return ImageFont.load_default()
 
-    # Each font is sized to fit its longest/widest text
     font_bold    = fit_font("Welcome",                                       bold_path,  160)
     font_regular = fit_font("to My Magic Mirror",                            reg_path,    72)
-    # Body: constrained by the longest body line
     font_body    = fit_font("to emulate a beauty standard silhouette.",      light_path,  60)
-    # Warning: possibly longer — shrink further if needed
     font_warn    = fit_font("WARNING: the display may cause you distress.",  light_path,
                             font_body.size if hasattr(font_body, "size") else 60)
 
     return font_bold, font_regular, font_body, font_warn
 
 
-# Cache fonts (keyed by output resolution so a resize re-loads correctly)
 _WELCOME_FONTS      = None
 _WELCOME_FONTS_SIZE = None
 
 
 def _make_welcome_frame(bg_base, t, out_w, out_h):
-    """
-    Render one frame of the animated welcome screen using PIL for crisp
-    clean sans-serif text, then convert back to OpenCV BGR.
-
-    All text is guaranteed to fit within a 90px left/right margin.
-    """
     from PIL import Image, ImageDraw
 
     global _WELCOME_FONTS, _WELCOME_FONTS_SIZE
@@ -1620,7 +1689,6 @@ def _make_welcome_frame(bg_base, t, out_w, out_h):
 
     H, W = out_h, out_w
 
-    # ── Shimmer layer ────────────────────────────────────────────────────────
     xs = np.linspace(0.0, 1.0, W, dtype=np.float32)
     ys = np.linspace(0.0, 1.0, H, dtype=np.float32)
     xv, yv = np.meshgrid(xs, ys)
@@ -1632,24 +1700,21 @@ def _make_welcome_frame(bg_base, t, out_w, out_h):
     shimmer = (alpha[:, :, None] * shimmer_bgr[None, None, :]).astype(np.float32)
     frame_bgr = np.clip(bg_base.astype(np.float32) + shimmer, 0, 255).astype(np.uint8)
 
-    # ── PIL text rendering ────────────────────────────────────────────────────
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     img  = Image.fromarray(frame_rgb)
     draw = ImageDraw.Draw(img)
 
     def draw_centred(text, y, font, color=(255, 255, 255)):
-        """Centre text, add a soft shadow, return the line height."""
         try:
             bb = draw.textbbox((0, 0), text, font=font)
             tw, th = bb[2] - bb[0], bb[3] - bb[1]
         except AttributeError:
             tw, th = draw.textsize(text, font=font)
         x = (W - tw) // 2
-        draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0))   # shadow
+        draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0))
         draw.text((x,     y    ), text, font=font, fill=color)
         return th
 
-    # ── Layout ────────────────────────────────────────────────────────────────
     line_gap = int(H * 0.018)
     para_gap = int(H * 0.050)
     y = int(H * 0.28)
@@ -1672,22 +1737,13 @@ def _make_welcome_frame(bg_base, t, out_w, out_h):
 
 
 def show_welcome_screen(window_name, duration=WELCOME_SCREEN_DURATION):
-    """
-    Display the animated welcome screen for `duration` seconds.
-    The user can press any key to skip.
-
-    The background is loaded from WELCOME_BG_PATH (next to the script or in cwd).
-    If the file is missing, a plain dark background is used as fallback.
-    """
     if duration <= 0:
         return
 
-    # Load + resize background
     bg_img = cv2.imread(WELCOME_BG_PATH)
     if bg_img is None:
-        # Fallback: dark navy background matching the image palette
         bg_img = np.zeros((OUTPUT_H, OUTPUT_W, 3), dtype=np.uint8)
-        bg_img[:, :] = (60, 20, 10)   # dark navy in BGR
+        bg_img[:, :] = (60, 20, 10)
         print(f"WARNING: welcome background not found at '{WELCOME_BG_PATH}', using plain colour.")
     else:
         bg_img = cv2.resize(bg_img, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
@@ -1703,7 +1759,7 @@ def show_welcome_screen(window_name, duration=WELCOME_SCREEN_DURATION):
         frame = _make_welcome_frame(bg_img, t, OUTPUT_W, OUTPUT_H)
         cv2.imshow(window_name, frame)
 
-        key = cv2.waitKey(16) & 0xFF   # ~60 fps cap; any key skips
+        key = cv2.waitKey(16) & 0xFF
         if key != 255:
             break
 
@@ -1712,7 +1768,6 @@ def show_welcome_screen(window_name, duration=WELCOME_SCREEN_DURATION):
 # BEAUTY STANDARD SELECTION SCREEN
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Grid constants (match the preview geometry)
 _SEL_MARGIN_X    = 60
 _SEL_MARGIN_Y_TOP = 40
 _SEL_MARGIN_Y_BOT = 60
@@ -1723,22 +1778,14 @@ _SEL_ROWS        = 3
 _SEL_CORNER_R    = 22
 _SEL_OUTLINE     = 6
 
-# Column 0 = MBS, Column 1 = FBS  (row 0..2)
 _SEL_NAMES = [
     ["MBS_1", "FBS_1"],
     ["MBS_2", "FBS_2"],
     ["MBS_3", "FBS_3"],
 ]
 
-_BS_IMAGE_DIR = "beauty_standard_images"
-
 
 def _load_bs_thumbnails(cell_w, cell_h):
-    """
-    Load and resize each beauty-standard image to fit inside cell_w × cell_h
-    (preserving aspect ratio, centred).
-    Returns a 2-D list matching _SEL_NAMES, each entry a PIL RGBA Image or None.
-    """
     from PIL import Image as PILImage
     thumbs = []
     for row in range(_SEL_ROWS):
@@ -1751,7 +1798,6 @@ def _load_bs_thumbnails(cell_w, cell_h):
                 print(f"WARNING: beauty standard image not found: {fpath}")
                 continue
             img = PILImage.open(fpath).convert("RGBA")
-            # Scale to fit cell while preserving aspect ratio
             img_w, img_h = img.size
             scale = min((cell_w - _SEL_OUTLINE*2) / img_w,
                         (cell_h - _SEL_OUTLINE*2) / img_h)
@@ -1764,39 +1810,22 @@ def _load_bs_thumbnails(cell_w, cell_h):
 
 
 def _cell_rect(row, col, grid_top, grid_left, cell_w, cell_h):
-    """Return (x0, y0, x1, y1) for a grid cell."""
     x0 = grid_left + col * (cell_w + _SEL_GAP_X)
     y0 = grid_top  + row * (cell_h + _SEL_GAP_Y)
     return x0, y0, x0 + cell_w, y0 + cell_h
 
 
-# How long the index finger must hover over a cell to select it (seconds).
-_SEL_HOVER_FRAMES = 50    # frames hand must point at cell to select
+_SEL_HOVER_FRAMES = 50
 
 
 def _get_index_tip_norm(hand_results, project=2.5):
-    """
-    Return a pointer position in normalised [0,1] coords derived from the
-    hand's overall pointing direction — more stable than fingertip tracking.
-
-    Direction vector: wrist (lm[0]) → index MCP (lm[5]).
-    This is the coarse pointing axis of the whole hand, which jitters much
-    less than the fingertip.  We start from the index MCP and project
-    `project` times the wrist-to-MCP distance forward along that axis.
-
-    project=2.5  means the cursor lands ~2.5 hand-lengths ahead of the MCP,
-    which feels natural for pointing at a screen from arm's length.
-    Increase to reach further; decrease to stay closer to the hand.
-    """
     if not hand_results.multi_hand_landmarks:
         return None, None
     lm = hand_results.multi_hand_landmarks[0].landmark
-    # Wrist → index MCP = coarse hand pointing axis
-    wx,  wy  = lm[0].x, lm[0].y   # wrist
-    mx,  my  = lm[5].x, lm[5].y   # index MCP (knuckle)
+    wx,  wy  = lm[0].x, lm[0].y
+    mx,  my  = lm[5].x, lm[5].y
     dx = mx - wx
     dy = my - wy
-    # Project forward from the MCP along the same axis
     px = mx + project * dx
     py = my + project * dy
     return float(np.clip(px, 0.0, 1.0)), float(np.clip(py, 0.0, 1.0))
@@ -1807,18 +1836,10 @@ def _make_selection_frame(bg_base, t, out_w, out_h,
                            grid_top, grid_left, cell_w, cell_h,
                            hover_fill,
                            tip_px=None):
-    """
-    Render one frame of the beauty-standard selection screen.
-
-    hover_fill : dict mapping (row,col) -> float in [0,1]
-                 0 = transparent, 1 = fully white (triggers selection)
-    tip_px     : (x,y) pixel position of index fingertip, or None
-    """
     from PIL import Image as PILImage, ImageDraw
 
     H, W = out_h, out_w
 
-    # Shimmer
     xs = np.linspace(0.0, 1.0, W, dtype=np.float32)
     ys = np.linspace(0.0, 1.0, H, dtype=np.float32)
     xv, yv = np.meshgrid(xs, ys)
@@ -1834,7 +1855,6 @@ def _make_selection_frame(bg_base, t, out_w, out_h,
     canvas = PILImage.fromarray(frame_rgb).convert("RGBA")
     draw   = ImageDraw.Draw(canvas)
 
-    # ── Header ───────────────────────────────────────────────────────────────
     header = "Please choose the beauty standard you would like to emulate"
     try:
         bb = draw.textbbox((0, 0), header, font=font_hdr)
@@ -1846,7 +1866,9 @@ def _make_selection_frame(bg_base, t, out_w, out_h,
     draw.text((hx + 2, hy + 2), header, font=font_hdr, fill=(0, 0, 0, 200))
     draw.text((hx,     hy    ), header, font=font_hdr, fill=(255, 255, 255, 255))
 
-    # ── Grid cells ────────────────────────────────────────────────────────────
+    shimmer_speed = 0.6
+    shimmer_wave  = (t * shimmer_speed) % 1.0
+
     overlay = PILImage.new("RGBA", (W, H), (0, 0, 0, 0))
     odraw   = ImageDraw.Draw(overlay)
 
@@ -1854,23 +1876,32 @@ def _make_selection_frame(bg_base, t, out_w, out_h,
         for col in range(_SEL_COLS):
             x0, y0, x1, y1 = _cell_rect(row, col, grid_top, grid_left,
                                           cell_w, cell_h)
-            fill_frac = hover_fill.get((row, col), 0.0)  # 0..1
+            fill_frac = hover_fill.get((row, col), 0.0)
 
-            # Fill alpha: 12 at rest → 255 when fully hovered
-            fill_a   = int(12 + fill_frac * 243)
-            # Outline thickens and warms slightly as hover grows
-            out_a    = int(200 + fill_frac * 55)
-            out_w_px = _SEL_OUTLINE + int(fill_frac * 4)
+            cell_diag  = (col / max(_SEL_COLS - 1, 1) + row / max(_SEL_ROWS - 1, 1)) * 0.5
+            phase      = np.pi * (cell_diag - shimmer_wave)
+            shimmer_v  = float(np.sin(phase) ** 2)
+
+            base_out_a  = 120
+            shimmer_add = int(shimmer_v * 100)
+            hover_add   = int(fill_frac * 35)
+            out_a       = min(255, base_out_a + shimmer_add + hover_add)
+            out_w_px    = _SEL_OUTLINE + int(fill_frac * 4)
+
+            r_out = 255
+            g_out = int(255 - (1.0 - shimmer_v) * 30 * (1.0 - fill_frac))
+            b_out = int(255 - (1.0 - shimmer_v) * 60 * (1.0 - fill_frac))
+
+            fill_a = int(8 + fill_frac * 247)
 
             odraw.rounded_rectangle(
                 [x0, y0, x1, y1],
                 radius=_SEL_CORNER_R,
                 fill=(255, 255, 255, fill_a),
-                outline=(255, 255, int(200 + fill_frac * 55), out_a),
+                outline=(r_out, g_out, b_out, out_a),
                 width=out_w_px,
             )
 
-            # Paste thumbnail
             thumb = thumbnails[row][col]
             if thumb is not None:
                 tw_i, th_i = thumb.size
@@ -1883,7 +1914,6 @@ def _make_selection_frame(bg_base, t, out_w, out_h,
 
     canvas = PILImage.alpha_composite(canvas, overlay)
 
-    # ── Index finger dot ──────────────────────────────────────────────────────
     result_bgr = cv2.cvtColor(np.array(canvas.convert("RGB")), cv2.COLOR_RGB2BGR)
     if tip_px is not None:
         tx, ty = tip_px
@@ -1894,19 +1924,6 @@ def _make_selection_frame(bg_base, t, out_w, out_h,
 
 
 def show_selection_screen(window_name, bg_base, cap):
-    """
-    Display the beauty-standard selection screen.
-
-    Interaction:
-      HAND: point index finger at a rectangle.  The cell fills white over
-            _SEL_HOVER_FRAMES frames.  When fully filled the screen exits
-            and returns the selected name.
-      KEYBOARD fallback: keys 1-6 select immediately (1-3 = MBS, 4-6 = FBS).
-      q / Esc: skip, returns None.
-
-    Sets the module-level current_beauty_standard string.
-    Returns the selected name stem (e.g. 'MBS_2') or None.
-    """
     global current_beauty_standard
 
     from PIL import ImageFont as PILFont, Image as _PI3, ImageDraw as _ID3
@@ -1914,7 +1931,6 @@ def show_selection_screen(window_name, bg_base, cap):
     out_w, out_h = OUTPUT_W, OUTPUT_H
     usable_w = out_w - 2 * _SEL_MARGIN_X
 
-    # ── Header font ───────────────────────────────────────────────────────────
     BOLD_PATHS = [
         "C:/Windows/Fonts/segoeuisb.ttf",
         "C:/Windows/Fonts/segoeuib.ttf",
@@ -1942,7 +1958,6 @@ def show_selection_screen(window_name, bg_base, cap):
     if font_hdr is None:
         font_hdr = PILFont.load_default()
 
-    # ── Grid geometry ─────────────────────────────────────────────────────────
     _dd = _ID3.Draw(_PI3.new("RGB", (1, 1)))
     try:
         hdr_bb = _dd.textbbox((0, 0), header_text, font=font_hdr)
@@ -1959,18 +1974,15 @@ def show_selection_screen(window_name, bg_base, cap):
 
     thumbnails = _load_bs_thumbnails(cell_w, cell_h)
 
-    # ── Keyboard fallback map ─────────────────────────────────────────────────
     key_to_cell = {
         ord('1'): (0,0), ord('2'): (1,0), ord('3'): (2,0),
         ord('4'): (0,1), ord('5'): (1,1), ord('6'): (2,1),
     }
 
-    # ── Per-cell hover dwell state ────────────────────────────────────────────
     hover_fill   = {(r, c): 0.0 for r in range(_SEL_ROWS) for c in range(_SEL_COLS)}
     hover_frames = {(r, c): 0   for r in range(_SEL_ROWS) for c in range(_SEL_COLS)}
-    DRAIN_SPEED  = 8   # frame-counts drained per frame when not hovering
+    DRAIN_SPEED  = 8
 
-    # ── Open a lightweight hands session just for this screen ─────────────────
     with mp.solutions.hands.Hands(
         static_image_mode=False,
         max_num_hands=1,
@@ -1982,21 +1994,14 @@ def show_selection_screen(window_name, bg_base, cap):
         start  = time.time()
         result = None
 
-        # Smoothed pointer position in normalised coords (exponential smoothing)
         smooth_nx, smooth_ny = None, None
-        SMOOTH_ALPHA = 0.35   # lower = smoother but more lag; 0.35 is a good balance
+        SMOOTH_ALPHA = 0.35
 
-        # Render throttle — only rebuild the PIL frame every RENDER_EVERY inferences.
-        # Inference + camera read ~25ms, PIL render ~100ms.  By rendering every 4th
-        # inference frame we run at ~camera speed instead of ~PIL speed.
         RENDER_EVERY   = 4
         infer_count    = 0
-        cached_frame   = None   # last rendered PIL→BGR frame
+        cached_frame   = None
 
         while result is None:
-            # ── Camera: grab several times to flush buffer, then decode once ───
-            # grab() is ~0.1ms (no decode); clears queued frames so we always
-            # get the latest one from the sensor.
             for _ in range(3):
                 cap.grab()
             ok, fr = cap.read()
@@ -2008,12 +2013,10 @@ def show_selection_screen(window_name, bg_base, cap):
             fr  = cv2.flip(fr, 1)
             rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
 
-            # ── Inference (every frame — cheap at model_complexity=0) ─────────
             hand_res       = hands_sel.process(rgb)
             raw_nx, raw_ny = _get_index_tip_norm(hand_res)
             infer_count   += 1
 
-            # ── Smooth pointer in normalised space ────────────────────────────
             if raw_nx is not None:
                 if smooth_nx is None:
                     smooth_nx, smooth_ny = raw_nx, raw_ny
@@ -2021,15 +2024,12 @@ def show_selection_screen(window_name, bg_base, cap):
                     smooth_nx = SMOOTH_ALPHA * raw_nx + (1 - SMOOTH_ALPHA) * smooth_nx
                     smooth_ny = SMOOTH_ALPHA * raw_ny + (1 - SMOOTH_ALPHA) * smooth_ny
             else:
-                # Hand lost — decay slowly toward last position, then drop
                 smooth_nx = smooth_ny = None
 
-            # Convert smoothed normalised → output pixel coords
             tip_px = None
             if smooth_nx is not None:
                 tip_px = (int(smooth_nx * out_w), int(smooth_ny * out_h))
 
-            # ── Update hover fill (every inference frame) ─────────────────────
             hovered_cell = None
             if tip_px is not None:
                 tx, ty = tip_px
@@ -2054,10 +2054,6 @@ def show_selection_screen(window_name, bg_base, cap):
                     hover_frames[cell] = max(0, hover_frames[cell] - DRAIN_SPEED)
                     hover_fill[cell]   = hover_frames[cell] / _SEL_HOVER_FRAMES
 
-            # ── Render only every RENDER_EVERY frames ─────────────────────────
-            # PIL compositing is the bottleneck (~100ms). Inference is ~25ms.
-            # We always show the cached frame between renders so the window
-            # stays responsive; hover state still updates every inference frame.
             if infer_count % RENDER_EVERY == 0 or cached_frame is None:
                 t = time.time() - start
                 cached_frame = _make_selection_frame(
@@ -2069,9 +2065,8 @@ def show_selection_screen(window_name, bg_base, cap):
                 )
 
             cv2.imshow(window_name, cached_frame)
-            key = cv2.waitKey(1) & 0xFF   # 1ms — don't add artificial delay
+            key = cv2.waitKey(1) & 0xFF
 
-            # Keyboard fallback
             if key in key_to_cell:
                 result = _SEL_NAMES[key_to_cell[key][0]][key_to_cell[key][1]]
             if key in (ord('q'), 27):
@@ -2085,6 +2080,76 @@ def show_selection_screen(window_name, bg_base, cap):
     current_beauty_standard = result
     print(f"Beauty standard selected: {result}")
     return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HOME SCREEN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def show_home_screen(window_name, cap, pose):
+    ABSENT_FRAMES = 5
+
+    bg_img = cv2.imread(WELCOME_BG_PATH)
+    if bg_img is None:
+        bg_img = np.zeros((OUTPUT_H, OUTPUT_W, 3), dtype=np.uint8)
+        bg_img[:, :] = (60, 20, 10)
+    else:
+        bg_img = cv2.resize(bg_img, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
+
+    absent_count = 0
+    armed        = False
+    start        = time.time()
+
+    with mp_pose.Pose(
+        static_image_mode=False,
+        model_complexity=0,
+        smooth_landmarks=False,
+        enable_segmentation=False,
+        min_detection_confidence=0.4,
+        min_tracking_confidence=0.4,
+    ) as pose_home:
+
+        while True:
+            ok, fr = cap.read()
+            if not ok:
+                break
+            fr  = rotate_frame(fr)
+            if fr.shape[:2] != bg_img.shape[:2]:
+                fr = cv2.resize(fr, (bg_img.shape[1], bg_img.shape[0]),
+                                interpolation=cv2.INTER_LINEAR)
+            fr  = cv2.flip(fr, 1)
+            rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+
+            res          = pose_home.process(rgb)
+            person_here  = (res.pose_landmarks is not None)
+
+            if person_here:
+                absent_count = 0
+                if armed:
+                    print("Home screen: person detected — showing welcome screen")
+                    show_welcome_screen(window_name, duration=WELCOME_SCREEN_DURATION)
+                    return
+            else:
+                absent_count += 1
+                if absent_count >= ABSENT_FRAMES:
+                    armed = True
+
+            t     = time.time() - start
+            xs    = np.linspace(0.0, 1.0, OUTPUT_W, dtype=np.float32)
+            ys    = np.linspace(0.0, 1.0, OUTPUT_H, dtype=np.float32)
+            xv, yv = np.meshgrid(xs, ys)
+            d     = 0.5 * (xv + yv)
+            speed = 0.18
+            phase = np.pi * (d - (t * speed) % 1.0)
+            alpha = (np.sin(phase) ** 2) * 0.28
+            shimmer_bgr = np.array([180.0, 50.0, 170.0], dtype=np.float32)
+            shimmer = (alpha[:, :, None] * shimmer_bgr[None, None, :]).astype(np.float32)
+            frame_out = np.clip(bg_img.astype(np.float32) + shimmer, 0, 255).astype(np.uint8)
+
+            cv2.imshow(window_name, frame_out)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2103,8 +2168,60 @@ def run_hand_brush_drag_arap_loop_skeleton(
     print("Entered run_hand_brush_drag_arap_loop_skeleton")
     binding = interaction_state["binding"]
 
+    # ── Load beauty-standard reference image ─────────────────────────────
+    _bs_overlay      = None
+    _bs_overlay_x    = 0
+    _bs_overlay_y    = 0
+    _BS_ALPHA        = 0.35
+    _BS_FIGURE_FRAC  = 1.00   # figure fills full image height
+
+    if current_beauty_standard:
+        _bs_path = os.path.join(_BS_IMAGE_DIR, f"{current_beauty_standard}.png")
+        _bs_raw  = cv2.imread(_bs_path, cv2.IMREAD_UNCHANGED)
+        if _bs_raw is None:
+            print(f"WARNING: could not load BS image: {_bs_path}")
+        else:
+            _cam_h_px  = interaction_state.get("person_height_px", h * 0.75)
+            _scale_cam_to_out = OUTPUT_H / h
+            _person_out_px    = _cam_h_px * _scale_cam_to_out
+            _src_h            = _bs_raw.shape[0]
+            _target_img_h     = int(_person_out_px / _BS_FIGURE_FRAC)
+            _target_img_w     = int(_bs_raw.shape[1] * _target_img_h / _src_h)
+            _bs_scaled        = cv2.resize(_bs_raw,
+                                           (_target_img_w, _target_img_h),
+                                           interpolation=cv2.INTER_AREA)
+            _BS_BOTTOM_MARGIN = 60
+            _bs_overlay_x = (OUTPUT_W - _target_img_w) // 2
+            _bs_overlay_y = OUTPUT_H - _target_img_h - _BS_BOTTOM_MARGIN
+            _bs_overlay   = _bs_scaled
+            print(f"BS overlay: {_target_img_w}x{_target_img_h} "
+                  f"at ({_bs_overlay_x},{_bs_overlay_y}), "
+                  f"person_height={_person_out_px:.0f}px")
+
+    # ── Finish button + auto-return state ───────────────────────────────
+    _restart_frames     = 0
+    _no_detect_frames   = 0
+    _NO_DETECT_LIMIT    = 10
+
+    from PIL import ImageFont as _FF2
+    _FBOLD2 = [
+        'C:/Windows/Fonts/segoeuisb.ttf',
+        'C:/Windows/Fonts/segoeuib.ttf',
+        'C:/Windows/Fonts/calibrib.ttf',
+        'C:/Windows/Fonts/arialbd.ttf',
+    ]
+    _finish_font = None
+    for _fp2 in _FBOLD2:
+        if os.path.exists(_fp2):
+            try: _finish_font = _FF2.truetype(_fp2, 36); break
+            except: pass
+    if _finish_font is None: _finish_font = _FF2.load_default()
+    _rbx0 = OUTPUT_W - _RESTART_MARGIN - _RESTART_W
+    _rbx1 = OUTPUT_W - _RESTART_MARGIN
+    _rby0 = _RESTART_MARGIN + 80
+    _rby1 = _rby0 + _RESTART_H
+
     while True:
-        # Read mutable brush radius from state (updated by pinch gesture)
         brush_radius = interaction_state.get('brush_radius', brush_radius)
 
         ok, frame_raw = cap.read()
@@ -2115,7 +2232,6 @@ def run_hand_brush_drag_arap_loop_skeleton(
             frame_raw = cv2.resize(frame_raw, (w, h), interpolation=cv2.INTER_LINEAR)
         frame_raw = cv2.flip(frame_raw, 1)
 
-        # Fix 4: background thread
         if inference_thread is not None:
             inference_thread.submit_frame(frame_raw)
             result = inference_thread.latest_result()
@@ -2131,7 +2247,16 @@ def run_hand_brush_drag_arap_loop_skeleton(
             hand_state = {"center":None,"is_open":False,"is_fist":False,
                           "over_body":False,"detected":False,"handedness":None}
 
-        # Fix 1+2: vectorized mesh with caching
+        _hand_also_gone = not hand_state.get('detected', False)
+        _person_visible = (cur_pts is not None) or (not _hand_also_gone)
+        if _person_visible:
+            _no_detect_frames = 0
+        else:
+            _no_detect_frames += 1
+            if _no_detect_frames >= _NO_DETECT_LIMIT:
+                print(f"No person/hand detected for {_NO_DETECT_LIMIT} frames — returning to welcome screen")
+                return "restart"
+
         V_track = None; frames = None
         stable_pts = smooth_pose_points(cur_pts, interaction_state, alpha=0.88, max_jump_px=120.0, hold_frames=1)
 
@@ -2156,12 +2281,23 @@ def run_hand_brush_drag_arap_loop_skeleton(
         hand_detected       = hand_state["detected"]
         hand_pinch_dist     = hand_state.get("pinch_dist", 1.0)
         hand_handedness_raw = hand_state.get("handedness")
-        # Mirror handedness label to match on-screen left/right
         if hand_handedness_raw == "Left":     hand_handedness = "Right"
         elif hand_handedness_raw == "Right":  hand_handedness = "Left"
         else:                                  hand_handedness = None
 
-        # ── Active hand filter ───────────────────────────────────────────
+        _restart_tip_out = None
+        if hand_detected and hand_center is not None:
+            _rx = int(hand_center[0] * OUTPUT_W / w)
+            _ry = int(hand_center[1] * OUTPUT_H / h)
+            _restart_tip_out = (_rx, _ry)
+            if not hasattr(run_hand_brush_drag_arap_loop_skeleton, '_dbg'):
+                run_hand_brush_drag_arap_loop_skeleton._dbg = 0
+            run_hand_brush_drag_arap_loop_skeleton._dbg += 1
+            if run_hand_brush_drag_arap_loop_skeleton._dbg % 90 == 0:
+                print(f'[BTN] hand_out={_restart_tip_out} zone=[{_rbx0-200}-{_rbx1+200}, {_rby0-200}-{_rby1+200}]')
+            if _rx < 0 or _rx > OUTPUT_W or _ry < 0 or _ry > OUTPUT_H:
+                pass
+
         active_hand  = interaction_state.get("active_hand", None)
         hand_allowed = (
             not hand_detected
@@ -2170,18 +2306,15 @@ def run_hand_brush_drag_arap_loop_skeleton(
             or hand_handedness is None
         )
 
-        # ── Peace-sign gesture: cycle active hand ─────────────────────────
-        # Hold a peace / V sign for ~0.7 s to cycle:
-        #   None -> this hand -> None -> ...
         hand_is_peace = hand_state.get("is_peace", False)
         if hand_detected:
             peace_fired = _peace_detector.update_raw(hand_is_peace)
             if peace_fired:
                 cur = interaction_state.get("active_hand", None)
                 if cur is None:
-                    nxt = hand_handedness   # lock to the hand making the sign
+                    nxt = hand_handedness
                 else:
-                    nxt = None             # any second sign unlocks
+                    nxt = None
                 interaction_state["active_hand"] = nxt
                 label = nxt if nxt is not None else "Either hand"
                 interaction_state["gesture_feedback_msg"]    = f"Active hand: {label}"
@@ -2190,7 +2323,6 @@ def run_hand_brush_drag_arap_loop_skeleton(
         else:
             _peace_detector.reset()
 
-        # ── Pinch gesture: resize brush ───────────────────────────────────
         if hand_detected:
             pinch_delta, is_pinching = _pinch_tracker.update_from_dist(hand_pinch_dist)
             if is_pinching:
@@ -2258,7 +2390,6 @@ def run_hand_brush_drag_arap_loop_skeleton(
             interaction_state["preview_triangles"][:] = False
             interaction_state["hand_was_open"] = False
 
-        # Build output
         layered_layers=None; render_order_used=FIXED_RENDER_ORDER
         yaw_amount=0.0; yaw_sign=0.0; yaw_state_txt="frontal"
         yaw_debug={"sign_value":0.0,"sign_value_smooth":0.0,"width_ratio":1.0}
@@ -2267,7 +2398,6 @@ def run_hand_brush_drag_arap_loop_skeleton(
         left_arm_score=0.0; right_arm_score=0.0; arm_override_used=False
         bg_plate = interaction_state.get("bg_plate")
 
-        # Optionally replace bg_plate with a live animated gradient
         if USE_ANIMATED_BACKGROUND:
             bg_plate = make_gradient_background(
                 h, w,
@@ -2303,7 +2433,6 @@ def run_hand_brush_drag_arap_loop_skeleton(
         else:
             warped_frame = frame_raw.copy()
 
-        # Visualization
         affected_vertices  = interaction_state["drag_vertices"]  if interaction_state["dragging"] else interaction_state["preview_vertices"]
         affected_triangles = (interaction_state["drag_triangles"] & active) if interaction_state["dragging"] else interaction_state["preview_triangles"]
         vis = warped_frame.copy()
@@ -2330,7 +2459,7 @@ def run_hand_brush_drag_arap_loop_skeleton(
                     edge_color=(255,150,246), edge_thickness=1, edge_alpha=0.95)
 
         vis_display = cv2.resize(vis, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
-        # ── Gesture feedback text ────────────────────────────────────────
+
         if interaction_state.get("gesture_feedback_frames", 0) > 0:
             interaction_state["gesture_feedback_frames"] -= 1
             msg = interaction_state.get("gesture_feedback_msg", "")
@@ -2340,7 +2469,6 @@ def run_hand_brush_drag_arap_loop_skeleton(
             cv2.putText(vis_display, msg, (tx, ty),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 255), 3, cv2.LINE_AA)
 
-        # ── Peace sign hold progress bar ──────────────────────────────────
         if hand_detected and hand_is_peace:
             prog = _peace_detector.progress()
             bar_w = int(OUTPUT_W * 0.5 * prog)
@@ -2350,11 +2478,15 @@ def run_hand_brush_drag_arap_loop_skeleton(
                           (bar_x, bar_y), (bar_x + bar_w, bar_y + 18),
                           (0, 255, 255), -1)
 
-        # ── Brush radius circle + settling feedback ───────────────────────
-        # Visible while pinch gesture is active (moving/settling) or locked.
+        _hand_near_button = (
+            _restart_tip_out is not None and
+            (_rbx0 - 200) <= _restart_tip_out[0] <= (_rbx1 + 200) and
+            (_rby0 - 200) <= _restart_tip_out[1] <= (_rby1 + 200)
+        )
         _show_brush_circle = (
             hand_detected and hand_center is not None and
-            (_pinch_tracker.is_active or _pinch_tracker.is_locked)
+            (_pinch_tracker.is_active or _pinch_tracker.is_locked) and
+            not _hand_near_button
         )
         if _show_brush_circle:
             scx = int(hand_center[0] * OUTPUT_W / w)
@@ -2363,21 +2495,93 @@ def run_hand_brush_drag_arap_loop_skeleton(
             display_r    = max(1, int(brush_radius * scale_factor))
             _br_overlay  = vis_display.copy()
             if _pinch_tracker.is_locked:
-                # Locked: dim grey circle, confirms size is committed
                 cv2.circle(_br_overlay, (scx, scy), display_r,
                            (160, 160, 160), 1, cv2.LINE_AA)
                 cv2.addWeighted(_br_overlay, 0.35, vis_display, 0.65, 0, vis_display)
             else:
-                # Active (moving or settling): bright white circle
                 cv2.circle(_br_overlay, (scx, scy), display_r,
                            (255, 255, 255), 2, cv2.LINE_AA)
                 cv2.addWeighted(_br_overlay, 0.70, vis_display, 0.30, 0, vis_display)
-                # Settling progress arc — cyan arc that fills as fingers go still
                 _prog = _pinch_tracker.settling_progress
                 if _prog > 0.0:
                     _angle = int(360 * _prog)
                     cv2.ellipse(vis_display, (scx, scy), (display_r, display_r),
                                 -90, 0, _angle, (0, 255, 255), 3, cv2.LINE_AA)
+
+        # ── Beauty-standard reference overlay ───────────────────────────
+        if _bs_overlay is not None:
+            ox, oy   = _bs_overlay_x, _bs_overlay_y
+            ow, oh_  = _bs_overlay.shape[1], _bs_overlay.shape[0]
+            x0 = max(ox, 0);             y0 = max(oy, 0)
+            x1 = min(ox + ow, OUTPUT_W); y1 = min(oy + oh_, OUTPUT_H)
+            sx0 = x0 - ox;  sy0 = y0 - oy
+            sx1 = sx0 + (x1 - x0); sy1 = sy0 + (y1 - y0)
+            if x1 > x0 and y1 > y0:
+                roi    = vis_display[y0:y1, x0:x1]
+                patch  = _bs_overlay[sy0:sy1, sx0:sx1]
+                if patch.shape[2] == 4:
+                    a      = patch[:,:,3:4].astype(np.float32) / 255.0
+                    a     *= _BS_ALPHA
+                    bgr    = patch[:,:,:3].astype(np.float32)
+                else:
+                    a      = np.full((y1-y0, x1-x0, 1), _BS_ALPHA, dtype=np.float32)
+                    bgr    = patch.astype(np.float32)
+                vis_display[y0:y1, x0:x1] = np.clip(
+                    a * bgr + (1.0 - a) * roi.astype(np.float32), 0, 255
+                ).astype(np.uint8)
+
+        # ── Finish button ─────────────────────────────────────────────────
+        _BTN_PAD = 200
+        _hovering_restart = (
+            _restart_tip_out is not None and
+            (_rbx0 - _BTN_PAD) <= _restart_tip_out[0] and
+            _restart_tip_out[0] <= (_rbx1 + _BTN_PAD) and
+            (_rby0 - _BTN_PAD) <= _restart_tip_out[1] <= (_rby1 + _BTN_PAD)
+        )
+        if _hovering_restart:
+            _restart_frames = min(_RESTART_FRAMES, _restart_frames + 1)
+        else:
+            _restart_frames = max(0, _restart_frames - 4)
+
+        _restart_frac = _restart_frames / _RESTART_FRAMES
+
+        if _restart_frac > 0:
+            _rb_ov = vis_display.copy()
+            cv2.rectangle(_rb_ov, (_rbx0, _rby0), (_rbx1, _rby1),
+                          (255, 255, 255), -1)
+            cv2.addWeighted(_rb_ov, _restart_frac * 0.85,
+                            vis_display, 1.0 - _restart_frac * 0.85,
+                            0, vis_display)
+        from PIL import Image as _FI, ImageDraw as _FD
+        _fimg = _FI.fromarray(cv2.cvtColor(vis_display, cv2.COLOR_BGR2RGB)).convert('RGBA')
+        _fdraw = _FD.Draw(_fimg)
+        _fdraw.rounded_rectangle(
+            [_rbx0, _rby0, _rbx1, _rby1],
+            radius=_RESTART_CORNER,
+            fill=None,
+            outline=(255, 255, 255, 230),
+            width=_RESTART_OUTLINE,
+        )
+        _ffont = _finish_font
+        _lbl = 'Finish'
+        _btn_cx = (_rbx0 + _rbx1) // 2
+        _btn_cy = (_rby0 + _rby1) // 2
+        _lbl_col = (0, 0, 0, 255) if _restart_frac > 0.5 else (255, 255, 255, 255)
+        _fdraw.text((_btn_cx + 2, _btn_cy + 2), _lbl, font=_ffont,
+                    fill=(0, 0, 0, 180), anchor='mm')
+        _fdraw.text((_btn_cx, _btn_cy), _lbl, font=_ffont,
+                    fill=_lbl_col, anchor='mm')
+        vis_display = cv2.cvtColor(np.array(_fimg.convert('RGB')), cv2.COLOR_RGB2BGR)
+
+        if _restart_tip_out is not None and _hand_near_button:
+            cv2.circle(vis_display, _restart_tip_out, 14,
+                       (255, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(vis_display, _restart_tip_out, 14,
+                       (180, 180, 255),  2, cv2.LINE_AA)
+
+        if _restart_frames >= _RESTART_FRAMES:
+            print("Finish triggered — returning to welcome screen")
+            return "restart"
 
         cv2.imshow(window_name, vis_display)
 
@@ -2397,10 +2601,6 @@ def run_hand_brush_drag_arap_loop_skeleton(
             interaction_state["dragging"] = False
             interaction_state["prev_hand_center"] = None
             interaction_state["hand_was_open"] = False
-
-        # Runtime warp-quality controls (no mesh rebuild needed)
-        # + / =  raise min_area threshold -> skip more tiny triangles -> faster
-        # - / _  lower min_area threshold -> warp more triangles    -> sharper
         elif key in (ord('+'), ord('=')):
             interaction_state['warp_min_area'] = min(
                 interaction_state.get('warp_min_area', 4.0) + 2.0, 30.0)
@@ -2420,6 +2620,8 @@ def run_hand_brush_drag_arap_loop_skeleton(
 def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_mask=False):
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
     if not cap.isOpened():
         print("Error: could not open camera."); return
     print("Camera found")
@@ -2429,14 +2631,12 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
     frame = rotate_frame(frame)
     h, w = frame.shape[:2]
 
-    # Initial placeholder mesh (replaced after body mask is ready)
     V_base, T, nx, ny = TMh.build_grid_mesh(w, h, step=step)
     V_def = V_base.copy().astype(np.float32)
     E = TMh.build_unique_edges(T)
     neighbors = TMh.build_vertex_neighbors(len(V_base), E)
     arap_cache = {"E": E, "neighbors": neighbors}
     brush_radius = max(45, int(min(w, h) * 0.07))
-    # Store in interaction_state so gesture handlers can update it
 
     interaction_state = {
         "preview_vertices":  np.zeros(len(V_def), dtype=bool),
@@ -2448,12 +2648,11 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
         "binding": None, "yaw_side_state": "frontal", "yaw_sign_value_smooth": 0.0,
         "bg_plate": None,
         "cached_frame_arrays": None, "cached_frames": None,
-        "warp_min_area": 4.0,  # +/- keys raise/lower at runtime
-        # Gesture state
-        "active_hand": None,         # None = either hand, "Left"/"Right" = locked
-        "gesture_feedback_frames": 0,# how many frames to show gesture feedback text
-        "gesture_feedback_msg": "",  # text to flash on screen
-        "brush_radius": brush_radius,  # mutable, changed by pinch gesture
+        "warp_min_area": 4.0,
+        "active_hand": None,
+        "gesture_feedback_frames": 0,
+        "gesture_feedback_msg": "",
+        "brush_radius": brush_radius,
     }
 
     window_name = "Hand brush drag on skeleton mesh"
@@ -2461,16 +2660,39 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
     cv2.moveWindow(window_name, PRIMARY_MONITOR_WIDTH, 0)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
+    # ── CHANGE 2: load initialization pose image once, outside the loop ───
+    _init_pose_img = None
+    if os.path.exists(_INIT_POSE_PATH):
+        _init_pose_raw = cv2.imread(_INIT_POSE_PATH, cv2.IMREAD_UNCHANGED)
+        if _init_pose_raw is not None:
+            # Scale it the same way as BS images: match person height.
+            # At this point we don't know person_height_px yet, so we scale
+            # to fill OUTPUT_H * 0.80 as a reasonable default — it will look
+            # the same every session since the pose image is fixed.
+            _ip_src_h = _init_pose_raw.shape[0]
+            _ip_target_h = int(OUTPUT_H * 0.80)
+            _ip_target_w = int(_init_pose_raw.shape[1] * _ip_target_h / _ip_src_h)
+            _init_pose_img = cv2.resize(_init_pose_raw,
+                                        (_ip_target_w, _ip_target_h),
+                                        interpolation=cv2.INTER_AREA)
+            print(f"Initialization pose image loaded: {_ip_target_w}x{_ip_target_h}")
+        else:
+            print(f"WARNING: could not read init pose image at {_INIT_POSE_PATH}")
+    else:
+        print(f"WARNING: init pose image not found at {_INIT_POSE_PATH}")
+
     with mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1) as segmenter, \
          mp.solutions.hands.Hands(static_image_mode=False, max_num_hands=1, model_complexity=1,
                                    min_detection_confidence=0.5, min_tracking_confidence=0.5) as hands, \
          mp_pose.Pose(static_image_mode=False, model_complexity=1, smooth_landmarks=False,
                       enable_segmentation=False, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
 
-        # ── Welcome screen ───────────────────────────────────────────────
-        show_welcome_screen(window_name, duration=WELCOME_SCREEN_DURATION)
+      while True:  # ── Outer restart loop ──────────────────────────────
+        _peace_detector.reset()
+        _pinch_tracker.reset()
 
-        # ── Load welcome background for reuse on selection screen ────────
+        show_home_screen(window_name, cap, pose)
+
         _sel_bg = cv2.imread(WELCOME_BG_PATH)
         if _sel_bg is None:
             _sel_bg = np.zeros((OUTPUT_H, OUTPUT_W, 3), dtype=np.uint8)
@@ -2478,7 +2700,6 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
         else:
             _sel_bg = cv2.resize(_sel_bg, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
 
-        # ── Beauty standard selection screen ─────────────────────────────
         selected_bs = show_selection_screen(window_name, _sel_bg, cap)
         if selected_bs is not None:
             print(f"Selected beauty standard: {selected_bs}")
@@ -2499,17 +2720,14 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
             if bg_plate is None:
                 print("Could not capture background plate.")
                 inference_thread.stop(); cap.release(); cv2.destroyAllWindows(); return
-            # Save to disk (create folder if needed, overwrite if exists)
             os.makedirs(_BG_DIR, exist_ok=True)
             cv2.imwrite(_BG_PATH, bg_plate)
             print(f"Background plate saved to {_BG_PATH}")
             interaction_state["bg_plate"] = bg_plate
         else:
-            # Load previously saved background from disk
             if os.path.exists(_BG_PATH):
                 bg_plate = cv2.imread(_BG_PATH)
                 if bg_plate is not None:
-                    # Resize to match current camera resolution if needed
                     if bg_plate.shape[:2] != (h, w):
                         bg_plate = cv2.resize(bg_plate, (w, h), interpolation=cv2.INTER_LINEAR)
                     interaction_state["bg_plate"] = bg_plate
@@ -2527,6 +2745,9 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
 
         initialized=False; max_init_frames=300; full_pose_streak=0; required_streak=20
         mask_accum=None; mask_count=0; best_stable_pts=None
+
+        # ── CHANGE 3: instruction line shown above countdown during init ──
+        _INIT_INSTRUCTION = "Please match the pose displayed on the screen."
 
         for k in range(max_init_frames):
             ok, fr = cap.read()
@@ -2549,8 +2770,8 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
                 full_pose_streak=0; mask_accum=None; mask_count=0; best_stable_pts=None
 
             init_vis = fr.copy()
-            msg   = f"Waiting for full-body pose... streak={full_pose_streak}/{required_streak}"
-            color = (0, 255, 255)
+            # ── CHANGE 1: no frame counter in status msg ──────────────────
+            status_msg = f"Waiting for full-body pose... streak={full_pose_streak}/{required_streak}"
 
             if full_pose_streak >= required_streak and mask_count > 0 and best_stable_pts is not None:
                 agg_mask = finalize_init_mask(mask_accum, mask_count, avg_thresh=0.28,
@@ -2560,35 +2781,28 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
                 init_mask_final   = trim_mask_arms_combined(init_mask_final, best_stable_pts,
                                                              min_component_area=250)
 
-                # ── Build adaptive Delaunay mesh from the body silhouette ──────
                 print("Building adaptive body mesh...")
-                # interior_step: coarse interior = fewer triangles = fast warp
-                # contour_step:  fine boundary = good silhouette, independently
                 V_base_adaptive, T_adaptive, active_adaptive = build_adaptive_body_mesh(
                     w=w, h=h,
                     body_mask=init_mask_final,
-                    interior_step=max(step * 2, 50),  # coarse interior — fast
-                    contour_step=10,                   # ~10px spacing on boundary
+                    interior_step=max(step * 2, 50),
+                    contour_step=10,
                     contour_inset=3,
                     min_contour_pts=60,
                 )
 
-                # Rebuild ARAP cache for the new mesh topology
                 E_new = TMh.build_unique_edges(T_adaptive)
                 nbrs_new = TMh.build_vertex_neighbors(len(V_base_adaptive), E_new)
                 arap_cache = {"E": E_new, "neighbors": nbrs_new}
 
-                # Update working mesh variables
                 V_base = V_base_adaptive.copy().astype(np.float32)
                 T      = T_adaptive
                 V_def  = V_base.copy().astype(np.float32)
 
-                # Resize interaction_state boolean arrays to match new mesh size
                 interaction_state["preview_vertices"]  = np.zeros(len(V_def), dtype=bool)
                 interaction_state["preview_triangles"] = np.zeros(len(T),     dtype=bool)
                 interaction_state["drag_vertices"]     = np.zeros(len(V_def), dtype=bool)
                 interaction_state["drag_triangles"]    = np.zeros(len(T),     dtype=bool)
-                # ─────────────────────────────────────────────────────────────
 
                 binding = bind_mesh_to_skeleton(
                     V_base=V_base, T=T,
@@ -2606,15 +2820,42 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
                     V_def  = V_base.copy().astype(np.float32)
                     interaction_state["binding"]      = binding
                     interaction_state["body_metrics"] = compute_body_metrics(best_stable_pts)
+                    _nose  = best_stable_pts.get("nose")
+                    _lankl = best_stable_pts.get("left_ankle")
+                    _rankl = best_stable_pts.get("right_ankle")
+                    if _nose is not None and (_lankl is not None or _rankl is not None):
+                        _ankl = _lankl if _lankl is not None else _rankl
+                        if _lankl is not None and _rankl is not None:
+                            _ankl = 0.5 * (_lankl + _rankl)
+                        interaction_state["person_height_px"] = float(abs(_ankl[1] - _nose[1]))
+                    else:
+                        interaction_state["person_height_px"] = float(h) * 0.75
                     initialized = True
                     print("Initialization succeeded")
-                    msg = "Pose locked. Starting..."; color = (0, 255, 0)
+                    status_msg = "Pose locked. Starting..."
 
-            cv2.putText(init_vis, msg, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
             if stable_pts is not None:
                 for name, p in stable_pts.items():
                     if p is not None: cv2.circle(init_vis, (int(p[0]),int(p[1])), 4, (0,255,0), -1, cv2.LINE_AA)
-            cv2.imshow(window_name, cv2.resize(init_vis, (OUTPUT_W,OUTPUT_H), interpolation=cv2.INTER_LINEAR))
+
+            _init_display = cv2.resize(init_vis, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
+
+            # ── CHANGE 2: composite the init pose image (same as BS overlay) ─
+            _init_display = _composite_init_pose_overlay(_init_display, _init_pose_img, _INIT_POSE_ALPHA)
+
+            # ── CHANGE 3: two-line text (instruction above, status below) ───
+            if initialized:
+                # Success — single line is fine
+                _init_display = _draw_countdown_text(_init_display, status_msg, OUTPUT_W, OUTPUT_H)
+            else:
+                _init_display = _draw_two_line_countdown_text(
+                    _init_display,
+                    _INIT_INSTRUCTION,
+                    status_msg,
+                    OUTPUT_W, OUTPUT_H,
+                )
+
+            cv2.imshow(window_name, _init_display)
             key = cv2.waitKey(1) & 0xFF
             if initialized: break
             if key == ord('q'):
@@ -2626,7 +2867,7 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
             inference_thread.stop(); cap.release(); cv2.destroyAllWindows(); return
 
         print("About to enter main skeleton loop")
-        run_hand_brush_drag_arap_loop_skeleton(
+        _loop_result = run_hand_brush_drag_arap_loop_skeleton(
             cap=cap, segmenter=segmenter, hands=hands, pose=pose,
             h=h, w=w, V_base=V_base, V_def=V_def, T=T,
             step=step, thresh=thresh, feather=feather, show_mask=show_mask,
@@ -2634,8 +2875,33 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
             arap_cache=arap_cache, inference_thread=inference_thread,
             window_name=window_name,
         )
-        print("Main skeleton loop returned")
+        print(f"Main skeleton loop returned: {_loop_result}")
         inference_thread.stop()
+
+        if _loop_result != "restart":
+            break
+
+        print("Restarting session...")
+        brush_radius = max(45, int(min(w, h) * 0.07))
+        interaction_state.update({
+            "preview_vertices":  np.zeros(len(V_def), dtype=bool),
+            "preview_triangles": np.zeros(len(T),     dtype=bool),
+            "drag_vertices":     np.zeros(len(V_def), dtype=bool),
+            "drag_triangles":    np.zeros(len(T),     dtype=bool),
+            "dragging": False, "prev_hand_center": None, "hand_was_open": False,
+            "pose_prev_pts": None, "pose_last_good_pts": None,
+            "pose_missing_count": 0,
+            "binding": None, "yaw_side_state": "frontal",
+            "yaw_sign_value_smooth": 0.0, "bg_plate": None,
+            "cached_frame_arrays": None, "cached_frames": None,
+            "warp_min_area": 4.0, "active_hand": None,
+            "gesture_feedback_frames": 0, "gesture_feedback_msg": "",
+            "brush_radius": brush_radius,
+        })
+        V_base, T, _, _ = TMh.build_grid_mesh(w, h, step=step)
+        V_def = V_base.copy().astype(np.float32)
+        E = TMh.build_unique_edges(T)
+        arap_cache = {"E": E, "neighbors": TMh.build_vertex_neighbors(len(V_base), E)}
 
     cap.release()
     cv2.destroyAllWindows()

@@ -2276,7 +2276,7 @@ def run_hand_brush_drag_arap_loop_skeleton(
     _bs_overlay_x    = 0      # top-left x on OUTPUT canvas
     _bs_overlay_y    = 0      # top-left y on OUTPUT canvas
     _BS_ALPHA        = 0.35   # opacity of the overlay (0=invisible, 1=opaque)
-    _BS_FIGURE_FRAC  = 0.80   # fraction of image height occupied by the figure
+    _BS_FIGURE_FRAC  = 1.00   # fraction of image height occupied by the figure
 
     if current_beauty_standard:
         _bs_path = os.path.join(_BS_IMAGE_DIR, f"{current_beauty_standard}.png")
