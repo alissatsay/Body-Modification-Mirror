@@ -1801,9 +1801,9 @@ def _load_welcome_fonts(out_w, out_h, margin=90):
         return ImageFont.load_default()
 
     font_bold    = fit_font("Welcome",                                       bold_path,  160)
-    font_regular = fit_font("to My Magic Mirror",                            reg_path,    72)
-    font_body    = fit_font("to emulate a beauty standard silhouette.",      light_path,  60)
-    font_warn    = fit_font("WARNING: the display may cause you distress.",  light_path,
+    font_regular = fit_font("Today, you are invited",                            reg_path,    72)
+    font_body    = fit_font("to become the sculptors of your own body...\nif your body lets you.",      reg_path,  60)
+    font_warn    = fit_font("WARNING: the display may cause you distress.",  reg_path,
                             font_body.size if hasattr(font_body, "size") else 60)
 
     return font_bold, font_regular, font_body, font_warn
@@ -1814,14 +1814,6 @@ _WELCOME_FONTS_SIZE = None
 
 
 def _make_welcome_frame(bg_base, t, out_w, out_h):
-    from PIL import Image, ImageDraw
-
-    global _WELCOME_FONTS, _WELCOME_FONTS_SIZE
-    if _WELCOME_FONTS is None or _WELCOME_FONTS_SIZE != (out_w, out_h):
-        _WELCOME_FONTS      = _load_welcome_fonts(out_w, out_h, margin=90)
-        _WELCOME_FONTS_SIZE = (out_w, out_h)
-    font_bold, font_regular, font_body, font_warn = _WELCOME_FONTS
-
     H, W = out_h, out_w
 
     xs = np.linspace(0.0, 1.0, W, dtype=np.float32)
@@ -1835,43 +1827,22 @@ def _make_welcome_frame(bg_base, t, out_w, out_h):
     shimmer = (alpha[:, :, None] * shimmer_bgr[None, None, :]).astype(np.float32)
     frame_bgr = np.clip(bg_base.astype(np.float32) + shimmer, 0, 255).astype(np.uint8)
 
-    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    img  = Image.fromarray(frame_rgb)
-    draw = ImageDraw.Draw(img)
+    welcome_text_path = os.path.join("UI_gestures", "welcome_text.png")
+    welcome_text_img  = cv2.imread(welcome_text_path, cv2.IMREAD_UNCHANGED)
+    if welcome_text_img is not None:
+        if welcome_text_img.shape[:2] != (H, W):
+            welcome_text_img = cv2.resize(welcome_text_img, (W, H), interpolation=cv2.INTER_AREA)
+        if welcome_text_img.shape[2] == 4:
+            a   = welcome_text_img[:, :, 3:4].astype(np.float32) / 255.0
+            bgr = welcome_text_img[:, :, :3].astype(np.float32)
+            frame_bgr = np.clip(a * bgr + (1.0 - a) * frame_bgr.astype(np.float32), 0, 255).astype(np.uint8)
+        else:
+            frame_bgr = cv2.addWeighted(welcome_text_img, 1.0, frame_bgr, 0.0, 0)
 
-    def draw_centred(text, y, font, color=(255, 255, 255)):
-        try:
-            bb = draw.textbbox((0, 0), text, font=font)
-            tw, th = bb[2] - bb[0], bb[3] - bb[1]
-        except AttributeError:
-            tw, th = draw.textsize(text, font=font)
-        x = (W - tw) // 2
-        draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0))
-        draw.text((x,     y    ), text, font=font, fill=color)
-        return th
-
-    line_gap = int(H * 0.018)
-    para_gap = int(H * 0.050)
-    y = int(H * 0.28)
-
-    h = draw_centred("Welcome",           y, font_bold);    y += h + line_gap
-    h = draw_centred("to My Magic Mirror", y, font_regular); y += h + para_gap
-
-    for line in ("You are invited to use hand gestures",
-                 "to emulate a beauty standard silhouette."):
-        h = draw_centred(line, y, font_body); y += h + line_gap
-
-    y += para_gap
-    draw_centred(
-        "WARNING: the display may cause you distress.",
-        y, font_warn,
-        color=(220, 200, 255),
-    )
-
-    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    return frame_bgr
 
 
-def show_welcome_screen(window_name, duration=WELCOME_SCREEN_DURATION):
+def show_welcome_screen(window_name, cap, duration=WELCOME_SCREEN_DURATION):
     if duration <= 0:
         return
 
@@ -1884,19 +1855,44 @@ def show_welcome_screen(window_name, duration=WELCOME_SCREEN_DURATION):
         bg_img = cv2.resize(bg_img, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
 
     start = time.time()
-    while True:
-        t       = time.time() - start
-        elapsed = t
+    no_detect_frames = 0
 
-        if elapsed >= duration:
-            break
+    with mp_pose.Pose(
+        static_image_mode=False,
+        model_complexity=0,
+        smooth_landmarks=False,
+        enable_segmentation=False,
+        min_detection_confidence=0.4,
+        min_tracking_confidence=0.4,
+    ) as pose_welcome:
 
-        frame = _make_welcome_frame(bg_img, t, OUTPUT_W, OUTPUT_H)
-        cv2.imshow(window_name, frame)
+        while True:
+            t       = time.time() - start
+            elapsed = t
 
-        key = cv2.waitKey(16) & 0xFF
-        if key != 255:
-            break
+            if elapsed >= duration:
+                break
+
+            ok, fr = cap.read()
+            if ok:
+                fr  = rotate_frame(fr)
+                fr  = cv2.flip(fr, 1)
+                rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+                res = pose_welcome.process(rgb)
+                if res.pose_landmarks is None:
+                    no_detect_frames += 1
+                    if no_detect_frames >= 10:
+                        print("No person during welcome screen — returning to home screen")
+                        return
+                else:
+                    no_detect_frames = 0
+
+            frame = _make_welcome_frame(bg_img, t, OUTPUT_W, OUTPUT_H)
+            cv2.imshow(window_name, frame)
+
+            key = cv2.waitKey(16) & 0xFF
+            if key != 255:
+                break
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2136,7 +2132,14 @@ def show_selection_screen(window_name, bg_base, cap):
     hover_frames = {(r, c): 0   for r in range(_SEL_ROWS) for c in range(_SEL_COLS)}
     DRAIN_SPEED  = 8
 
-    with mp.solutions.hands.Hands(
+    with mp_pose.Pose(
+        static_image_mode=False,
+        model_complexity=0,
+        smooth_landmarks=False,
+        enable_segmentation=False,
+        min_detection_confidence=0.4,
+        min_tracking_confidence=0.4,
+    ) as pose_sel, mp.solutions.hands.Hands(
         static_image_mode=False,
         max_num_hands=1,
         model_complexity=0,
@@ -2145,6 +2148,7 @@ def show_selection_screen(window_name, bg_base, cap):
     ) as hands_sel:
 
         start  = time.time()
+        no_detect_frames_sel = 0
         result = None
 
         smooth_nx, smooth_ny = None, None
@@ -2169,6 +2173,15 @@ def show_selection_screen(window_name, bg_base, cap):
             hand_res       = hands_sel.process(rgb)
             raw_nx, raw_ny = _get_index_tip_norm(hand_res)
             infer_count   += 1
+
+            pose_res_sel = pose_sel.process(rgb)
+            if pose_res_sel.pose_landmarks is None:
+                no_detect_frames_sel += 1
+                if no_detect_frames_sel >= 10:
+                    print("No person during selection — returning to home screen")
+                    result = "__skip__"
+            else:
+                no_detect_frames_sel = 0
 
             if raw_nx is not None:
                 if smooth_nx is None:
@@ -2241,6 +2254,7 @@ def show_selection_screen(window_name, bg_base, cap):
 
 def show_home_screen(window_name, cap, pose):
     ABSENT_FRAMES = 5
+    PRESENT_FRAMES = 3
 
     bg_img = cv2.imread(WELCOME_BG_PATH)
     if bg_img is None:
@@ -2249,9 +2263,10 @@ def show_home_screen(window_name, cap, pose):
     else:
         bg_img = cv2.resize(bg_img, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
 
-    absent_count = 0
-    armed        = False
-    start        = time.time()
+    armed          = False
+    present_count  = 0
+    absent_count   = 0
+    start          = time.time()
 
     with mp_pose.Pose(
         static_image_mode=False,
@@ -2277,15 +2292,13 @@ def show_home_screen(window_name, cap, pose):
             person_here  = (res.pose_landmarks is not None)
 
             if person_here:
-                absent_count = 0
-                if armed:
+                present_count += 1
+                if present_count >= 2:
                     print("Home screen: person detected — showing welcome screen")
-                    show_welcome_screen(window_name, duration=WELCOME_SCREEN_DURATION)
+                    show_welcome_screen(window_name, cap, duration=WELCOME_SCREEN_DURATION)
                     return
             else:
-                absent_count += 1
-                if absent_count >= ABSENT_FRAMES:
-                    armed = True
+                present_count = 0
 
             t     = time.time() - start
             xs    = np.linspace(0.0, 1.0, OUTPUT_W, dtype=np.float32)
@@ -2619,7 +2632,7 @@ def run_hand_brush_drag_arap_loop_skeleton(
                 interaction_state["prev_hand_center"] = hand_center
                 if abs(dx) >= 1 or abs(dy) >= 1:
                     print("dx dy:", dx, dy)
-                    V_new = TMh.apply_arap_drag_step(
+                    V_new = TMh.apply_arap_drag_step_2(
                         V_track=V_track, V_def=V_def, T=T, active_triangles=active,
                         drag_vertices=interaction_state["drag_vertices"],
                         delta_xy=np.array([dx, dy], dtype=np.float32),
@@ -2970,7 +2983,9 @@ def run_hand_brush_drag_arap_loop_skeleton(
                 alpha = (_drag_ui_timer / _DRAG_UI_DURATION) ** 1.5
 
                 drag_steps = [
+                    (open_palm_icon, "Hide one hand behind your body"),
                     (open_palm_icon, "Hover over your body"),
+                    (open_palm_icon, "Look for the highlight"),
                     (fist_icon, "Slowly make a fist"),
                     (fist_drag_icon, "Slowly drag away"),
                     (open_palm_icon, "Let go"),
@@ -3278,6 +3293,7 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
 
         initialized=False; max_init_frames=300; full_pose_streak=0; required_streak=20
         mask_accum=None; mask_count=0; best_stable_pts=None
+        _no_detect_frames_init = 0
 
         # ── CHANGE 3: instruction line shown above countdown during init ──
         _INIT_INSTRUCTION = "Hold still."
@@ -3291,6 +3307,13 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
             fr = cv2.flip(fr, 1)
             rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
             cur_pts = extract_pose_points(rgb, pose, w, h, min_vis=0.25)
+            if cur_pts is None:
+                _no_detect_frames_init += 1
+                if _no_detect_frames_init >= 10:
+                    print("No person detected for 10 frames during init — restarting")
+                    break
+            else:
+                _no_detect_frames_init = 0
             stable_pts = smooth_pose_points(cur_pts, interaction_state, alpha=0.65, max_jump_px=45.0, hold_frames=2)
             full_pose_ok = has_required_landmarks(stable_pts)
 
@@ -3396,8 +3419,9 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
 
         print(f"Init loop done. initialized={initialized}")
         if not initialized:
-            print("Could not initialize.")
-            inference_thread.stop(); cap.release(); cv2.destroyAllWindows(); return
+            print("Could not initialize — restarting to home screen.")
+            inference_thread.stop()
+            continue
 
         print("About to enter main skeleton loop")
         _loop_result = run_hand_brush_drag_arap_loop_skeleton(

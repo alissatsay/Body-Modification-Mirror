@@ -768,8 +768,8 @@ def apply_arap_drag_step_2(
     region_rings=6,
     n_iters=5,
     falloff_power=1.6,
-    ref_track_weight=0.25,
-    boundary_track_weight=0.10,
+    ref_track_weight=0.10,
+    boundary_track_weight=0.02,
 ):
     """
     One incremental ARAP drag step in screen coordinates.
