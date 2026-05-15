@@ -4,6 +4,7 @@ import numpy as np
 import mediapipe as mp
 import time
 import threading
+import random
 from scipy.spatial import Delaunay
 
 mp_pose = mp.solutions.pose
@@ -157,7 +158,7 @@ RIGHT_SIDE_FRONT_RENDER_ORDER = [
 ]
 
 # ── Gesture / interaction constants ──────────────────────────────────────
-BRUSH_RADIUS_MIN = 20
+BRUSH_RADIUS_MIN = 25
 BRUSH_RADIUS_MAX = 300
 
 # Finish button geometry (top-right corner of OUTPUT canvas)
@@ -168,10 +169,10 @@ _RESTART_CORNER  = 18    # rounded corner radius
 _RESTART_OUTLINE = 5     # outline thickness
 _RESTART_FRAMES  = 50    # frames to dwell before triggering finish
 
-LEG_OVERLAP_TRIGGER_FRAC = 0.015
-LEG_FRONT_SCORE_DEADBAND = 8.0
-ARM_OVERLAP_TRIGGER_FRAC = 0.020
-ARM_FRONT_SCORE_DEADBAND = 6.0
+_MODE_BTN_W = 220
+_MODE_BTN_H = 90
+_MODE_BTN_MARGIN = 30
+_MODE_BTN_GAP = 20
 
 # ── Beauty-standard image directory ──────────────────────────────────────
 _BS_IMAGE_DIR = "beauty_standard_images"
@@ -179,6 +180,14 @@ _BS_IMAGE_DIR = "beauty_standard_images"
 # ── Initialization pose image ─────────────────────────────────────────────
 _INIT_POSE_PATH = os.path.join("UI_gestures", "initialization_pose.png")
 _INIT_POSE_ALPHA = 0.35   # same opacity as BS overlay
+
+SESSION_DURATION_SECONDS = 180.0   # 3 minutes per session
+TIMEOUT_MESSAGE_DURATION = 5.0     # seconds to show the message
+
+_BS_ALL_NAMES = {
+    "MBS": ["MBS_1", "MBS_2", "MBS_3"],
+    "FBS": ["FBS_1", "FBS_2", "FBS_3"],
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -266,6 +275,78 @@ def build_adaptive_body_mesh(
           f"{len(interior_pts)} interior pts)")
 
     return V, T, active
+
+def _pick_new_beauty_standard(current):
+    if not current:
+        return current
+    prefix = current[:3].upper()   # "MBS" or "FBS"
+    candidates = _BS_ALL_NAMES.get(prefix, [])
+    alternatives = [c for c in candidates if c != current]
+    if not alternatives:
+        return current
+    return random.choice(alternatives)
+
+def _draw_timeout_message(canvas, new_bs_name):
+    from PIL import Image as _PI, ImageDraw as _PD, ImageFont as _PF
+    BOLD_PATHS = ["C:/Windows/Fonts/segoeuisb.ttf","C:/Windows/Fonts/segoeuib.ttf",
+                  "C:/Windows/Fonts/calibrib.ttf","C:/Windows/Fonts/arialbd.ttf","C:/Windows/Fonts/arial.ttf"]
+    REG_PATHS  = ["C:/Windows/Fonts/segoeui.ttf","C:/Windows/Fonts/calibri.ttf","C:/Windows/Fonts/arial.ttf"]
+    W, H = OUTPUT_W, OUTPUT_H
+    usable_w = W - 120
+
+    def _first(paths):
+        for p in paths:
+            if os.path.exists(p): return p
+        return None
+
+    def _fit(text, path, start=60, mn=18):
+        if path is None: return _PF.load_default()
+        tmp = _PD.Draw(_PI.new("RGB", (1, 1)))
+        for sz in range(start, mn - 1, -1):
+            try:
+                f = _PF.truetype(path, sz)
+                bb = tmp.textbbox((0, 0), text, font=f)
+                if (bb[2] - bb[0]) <= usable_w: return f
+            except Exception: continue
+        return _PF.load_default()
+
+    line1 = "Ooops, we're sorry but you ran out of time."
+    line2 = "The body shape you were trying to match is no longer deemed beautiful."
+    line3 = f"The current beauty standard is:"
+
+    font1 = _fit(line1, _first(BOLD_PATHS), 60)
+    font2 = _fit(line2, _first(REG_PATHS),  52)
+    font3 = _fit(line3, _first(BOLD_PATHS), 56)
+
+    img  = _PI.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+    draw = _PD.Draw(img)
+
+    def _measure(text, font):
+        try:
+            bb = draw.textbbox((0, 0), text, font=font)
+            return bb[2]-bb[0], bb[3]-bb[1]
+        except AttributeError:
+            return draw.textsize(text, font=font)
+
+    w1,h1 = _measure(line1, font1)
+    w2,h2 = _measure(line2, font2)
+    w3,h3 = _measure(line3, font3)
+    gap = int(H * 0.022)
+    total_h = h1 + gap + h2 + gap + h3
+    y = (H - total_h) // 2
+
+    def _draw_line(text, font, y, color=(255,255,255)):
+        w_, h_ = _measure(text, font)
+        x = (W - w_) // 2
+        draw.text((x+2, y+2), text, font=font, fill=(0,0,0))
+        draw.text((x,   y  ), text, font=font, fill=color)
+        return h_
+
+    h_ = _draw_line(line1, font1, y, (255,255,255));  y += h_ + gap
+    h_ = _draw_line(line2, font2, y, (220,220,220));  y += h_ + gap
+    _draw_line(line3, font3, y, (220,200,255))
+
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -496,6 +577,59 @@ def _draw_countdown_text(frame_bgr, text, out_w, out_h):
     draw.text((x,     y    ), text, font=font, fill=(255, 255, 255))
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
+def draw_pinch_hint_under_button(vis_display, pinch_icon, button_x0, button_y1, button_w):
+    hint_text = "Pinch to click"
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.8
+    thickness = 2
+
+    (tw, th), baseline = cv2.getTextSize(hint_text, font, font_scale, thickness)
+
+    gap = 10
+    icon_gap = 8
+
+    icon_w = pinch_icon.shape[1] if pinch_icon is not None else 0
+    icon_h = pinch_icon.shape[0] if pinch_icon is not None else 0
+
+    total_w = icon_w + icon_gap + tw
+
+    group_x = button_x0 + (button_w - total_w) // 2
+    group_y = button_y1 + gap
+
+    icon_x = group_x
+    icon_y = group_y
+
+    text_x = group_x + icon_w + icon_gap
+    text_y = group_y + (icon_h + th) // 2
+
+    if pinch_icon is not None:
+        vis_display = overlay_bgra(vis_display, pinch_icon, icon_x, icon_y)
+
+    cv2.putText(
+        vis_display,
+        hint_text,
+        (text_x + 2, text_y + 2),
+        font,
+        font_scale,
+        (0, 0, 0),
+        thickness + 1,
+        cv2.LINE_AA
+    )
+
+    cv2.putText(
+        vis_display,
+        hint_text,
+        (text_x, text_y),
+        font,
+        font_scale,
+        (255, 255, 255),
+        thickness,
+        cv2.LINE_AA
+    )
+
+    return vis_display
+
 
 def _draw_two_line_countdown_text(frame_bgr, line1, line2, out_w, out_h):
     """
@@ -620,6 +754,7 @@ def show_countdown(cap, h, w, seconds, message, window_name,
         # ── CHANGE 1: no frame counter ────────────────────────────────────
         text        = f"{message} in {remaining}"
         vis_display = cv2.resize(fr, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
+        vis_display = _composite_init_pose_overlay(vis_display, bs_img, _INIT_POSE_ALPHA)
         vis_display = _draw_countdown_text(vis_display, text, OUTPUT_W, OUTPUT_H)
         cv2.imshow(window_name, vis_display)
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -1830,6 +1965,24 @@ def _get_index_tip_norm(hand_results, project=2.5):
     py = my + project * dy
     return float(np.clip(px, 0.0, 1.0)), float(np.clip(py, 0.0, 1.0))
 
+def overlay_bgra(base_bgr, overlay_bgra, x, y):
+    h, w = overlay_bgra.shape[:2]
+
+    x1 = min(x + w, base_bgr.shape[1])
+    y1 = min(y + h, base_bgr.shape[0])
+
+    if x >= x1 or y >= y1:
+        return base_bgr
+
+    overlay_crop = overlay_bgra[0:(y1 - y), 0:(x1 - x)]
+    roi = base_bgr[y:y1, x:x1]
+
+    bgr = overlay_crop[:, :, :3].astype(np.float32)
+    alpha = overlay_crop[:, :, 3:4].astype(np.float32) / 255.0
+
+    roi[:] = (alpha * bgr + (1 - alpha) * roi.astype(np.float32)).astype(np.uint8)
+    return base_bgr
+
 
 def _make_selection_frame(bg_base, t, out_w, out_h,
                            font_hdr, thumbnails,
@@ -2164,16 +2317,21 @@ def run_hand_brush_drag_arap_loop_skeleton(
     inference_thread=None,
     window_name="Hand brush drag on skeleton mesh",
 ):
-    global SHOW_MESH_OUTLINE
+    global SHOW_MESH_OUTLINE, current_beauty_standard
     print("Entered run_hand_brush_drag_arap_loop_skeleton")
     binding = interaction_state["binding"]
+
+    _session_start     = time.time()
+    _timeout_fired     = False
+    _timeout_msg_start = 0.0
+    _timeout_new_bs    = ""
 
     # ── Load beauty-standard reference image ─────────────────────────────
     _bs_overlay      = None
     _bs_overlay_x    = 0
     _bs_overlay_y    = 0
     _BS_ALPHA        = 0.35
-    _BS_FIGURE_FRAC  = 1.00   # figure fills full image height
+    _BS_FIGURE_FRAC  = 0.82   # figure fills full image height
 
     if current_beauty_standard:
         _bs_path = os.path.join(_BS_IMAGE_DIR, f"{current_beauty_standard}.png")
@@ -2200,8 +2358,65 @@ def run_hand_brush_drag_arap_loop_skeleton(
 
     # ── Finish button + auto-return state ───────────────────────────────
     _restart_frames     = 0
+    interaction_mode = "drag"
+
+    _DRAG_UI_DURATION = 150
+    _drag_ui_timer = _DRAG_UI_DURATION
+    _mode_click_cooldown = 0
     _no_detect_frames   = 0
     _NO_DETECT_LIMIT    = 10
+    # Finish pinch-click tracking
+    _finish_prev_pinch_dist = 1.0
+    _finish_pinch_click_cooldown = 0
+
+    _FINISH_PINCH_OPEN_DIST = 0.05     # fingers considered open
+    _FINISH_PINCH_CLOSED_DIST = 0.02  # fingers considered clicked/pinched
+    _FINISH_PINCH_DROP_MIN = 0.025     # required distance drop
+    _FINISH_CLICK_COOLDOWN = 10        # prevents repeated clicks
+
+    LEG_OVERLAP_TRIGGER_FRAC = 0.015
+    LEG_FRONT_SCORE_DEADBAND = 8.0
+    ARM_OVERLAP_TRIGGER_FRAC = 0.020
+    ARM_FRONT_SCORE_DEADBAND = 6.0
+
+    # ── Finish button images (load once) ─────────────────────────────
+    finish_btn_normal = cv2.imread("buttons/finish.png", cv2.IMREAD_UNCHANGED)
+    finish_btn_hover  = cv2.imread("buttons/finish_hover.png", cv2.IMREAD_UNCHANGED)
+    finish_btn_click  = cv2.imread("buttons/finish_clicked.png", cv2.IMREAD_UNCHANGED)
+
+    finish_btn_normal = cv2.resize(finish_btn_normal, (_RESTART_W, _RESTART_H))
+    finish_btn_hover  = cv2.resize(finish_btn_hover,  (_RESTART_W, _RESTART_H))
+    finish_btn_click  = cv2.resize(finish_btn_click,  (_RESTART_W, _RESTART_H))
+
+    brush_btn_normal = cv2.imread("buttons/brush.png", cv2.IMREAD_UNCHANGED)
+    brush_btn_hover  = cv2.imread("buttons/brush_hover.png", cv2.IMREAD_UNCHANGED)
+    brush_btn_click  = cv2.imread("buttons/brush_clicked.png", cv2.IMREAD_UNCHANGED)
+
+    drag_btn_normal = cv2.imread("buttons/drag.png", cv2.IMREAD_UNCHANGED)
+    drag_btn_hover  = cv2.imread("buttons/drag_hover.png", cv2.IMREAD_UNCHANGED)
+    drag_btn_click  = cv2.imread("buttons/drag_clicked.png", cv2.IMREAD_UNCHANGED)
+
+    brush_btn_normal = cv2.resize(brush_btn_normal, (_MODE_BTN_W, _MODE_BTN_H))
+    brush_btn_hover  = cv2.resize(brush_btn_hover,  (_MODE_BTN_W, _MODE_BTN_H))
+    brush_btn_click  = cv2.resize(brush_btn_click,  (_MODE_BTN_W, _MODE_BTN_H))
+
+    drag_btn_normal = cv2.resize(drag_btn_normal, (_MODE_BTN_W, _MODE_BTN_H))
+    drag_btn_hover  = cv2.resize(drag_btn_hover,  (_MODE_BTN_W, _MODE_BTN_H))
+    drag_btn_click  = cv2.resize(drag_btn_click,  (_MODE_BTN_W, _MODE_BTN_H))
+
+    pinch_icon = cv2.imread("UI_gestures/pinch.png", cv2.IMREAD_UNCHANGED)
+    open_palm_icon = cv2.imread("UI_gestures/open_palm.png", cv2.IMREAD_UNCHANGED)
+    fist_icon = cv2.imread("UI_gestures/fist.png", cv2.IMREAD_UNCHANGED)
+    fist_drag_icon = cv2.imread("UI_gestures/fist_drag.png", cv2.IMREAD_UNCHANGED)
+
+    _PINCH_ICON_H = 42
+    if pinch_icon is not None:
+        scale = _PINCH_ICON_H / pinch_icon.shape[0]
+        pinch_icon = cv2.resize(
+            pinch_icon,
+            (int(pinch_icon.shape[1] * scale), _PINCH_ICON_H),
+            interpolation=cv2.INTER_AREA
+        )
 
     from PIL import ImageFont as _FF2
     _FBOLD2 = [
@@ -2220,6 +2435,17 @@ def run_hand_brush_drag_arap_loop_skeleton(
     _rbx1 = OUTPUT_W - _RESTART_MARGIN
     _rby0 = _RESTART_MARGIN + 80
     _rby1 = _rby0 + _RESTART_H
+
+    # ── Brush / Drag button positions ────────────────────────────────
+    brush_x0 = _MODE_BTN_MARGIN
+    brush_y0 = _rby0
+    brush_x1 = brush_x0 + _MODE_BTN_W
+    brush_y1 = brush_y0 + _MODE_BTN_H
+
+    drag_x0 = brush_x1 + _MODE_BTN_GAP
+    drag_y0 = _rby0
+    drag_x1 = drag_x0 + _MODE_BTN_W
+    drag_y1 = drag_y0 + _MODE_BTN_H
 
     while True:
         brush_radius = interaction_state.get('brush_radius', brush_radius)
@@ -2246,6 +2472,34 @@ def run_hand_brush_drag_arap_loop_skeleton(
             cur_pts  = None
             hand_state = {"center":None,"is_open":False,"is_fist":False,
                           "over_body":False,"detected":False,"handedness":None}
+            
+        _now = time.time()
+        _elapsed_session = _now - _session_start
+
+        if not _timeout_fired and _elapsed_session >= SESSION_DURATION_SECONDS:
+            _timeout_new_bs    = _pick_new_beauty_standard(current_beauty_standard)
+            _timeout_fired     = True
+            _timeout_msg_start = _now
+            print(f"Session timeout: rotating BS '{current_beauty_standard}' -> '{_timeout_new_bs}'")
+
+        if _timeout_fired:
+            if (_now - _timeout_msg_start) >= TIMEOUT_MESSAGE_DURATION:
+                current_beauty_standard = _timeout_new_bs
+                # reload the BS overlay with the new standard
+                if current_beauty_standard:
+                    _bs_path = os.path.join(_BS_IMAGE_DIR, f"{current_beauty_standard}.png")
+                    _bs_raw  = cv2.imread(_bs_path, cv2.IMREAD_UNCHANGED)
+                    if _bs_raw is not None:
+                        _cam_h_px      = interaction_state.get("person_height_px", h * 0.75)
+                        _person_out_px = _cam_h_px * (OUTPUT_H / h)
+                        _target_img_h  = int(_person_out_px / _BS_FIGURE_FRAC)
+                        _target_img_w  = int(_bs_raw.shape[1] * _target_img_h / _bs_raw.shape[0])
+                        _bs_overlay    = cv2.resize(_bs_raw, (_target_img_w, _target_img_h), interpolation=cv2.INTER_AREA)
+                        _bs_overlay_x  = (OUTPUT_W - _target_img_w) // 2
+                        _bs_overlay_y  = OUTPUT_H - _target_img_h - 60
+                _session_start = _now
+                _timeout_fired = False
+                print(f"BS switched to '{current_beauty_standard}', timer reset.")
 
         _hand_also_gone = not hand_state.get('detected', False)
         _person_visible = (cur_pts is not None) or (not _hand_also_gone)
@@ -2323,14 +2577,20 @@ def run_hand_brush_drag_arap_loop_skeleton(
         else:
             _peace_detector.reset()
 
-        if hand_detected:
+        if interaction_mode == "brush" and hand_detected:
             pinch_delta, is_pinching = _pinch_tracker.update_from_dist(hand_pinch_dist)
+
             if is_pinching:
                 old_r = interaction_state.get("brush_radius", brush_radius)
                 new_r = int(np.clip(old_r + pinch_delta, BRUSH_RADIUS_MIN, BRUSH_RADIUS_MAX))
                 if new_r != old_r:
                     interaction_state["brush_radius"] = new_r
                     brush_radius = new_r
+
+            if _pinch_tracker.is_locked:
+                interaction_mode = "drag"
+                _drag_ui_timer = _DRAG_UI_DURATION
+                _pinch_tracker.reset()
         else:
             _pinch_tracker.reset()
 
@@ -2509,7 +2769,7 @@ def run_hand_brush_drag_arap_loop_skeleton(
                                 -90, 0, _angle, (0, 255, 255), 3, cv2.LINE_AA)
 
         # ── Beauty-standard reference overlay ───────────────────────────
-        if _bs_overlay is not None:
+        if _bs_overlay is not None and not _timeout_fired:
             ox, oy   = _bs_overlay_x, _bs_overlay_y
             ow, oh_  = _bs_overlay.shape[1], _bs_overlay.shape[0]
             x0 = max(ox, 0);             y0 = max(oy, 0)
@@ -2529,59 +2789,332 @@ def run_hand_brush_drag_arap_loop_skeleton(
                 vis_display[y0:y1, x0:x1] = np.clip(
                     a * bgr + (1.0 - a) * roi.astype(np.float32), 0, 255
                 ).astype(np.uint8)
+        if _timeout_fired:
+            scrim = vis_display.copy()
+            scrim[:] = (0, 0, 0)
+            vis_display = cv2.addWeighted(scrim, 0.45, vis_display, 0.55, 0)
+            vis_display = _draw_timeout_message(vis_display, _timeout_new_bs)
 
         # ── Finish button ─────────────────────────────────────────────────
+        # ── Finish button: point + pinch to click ──────────────────────────
+        # ── Finish button: PNG states ────────────────────────────────────
+
         _BTN_PAD = 200
+
         _hovering_restart = (
             _restart_tip_out is not None and
-            (_rbx0 - _BTN_PAD) <= _restart_tip_out[0] and
-            _restart_tip_out[0] <= (_rbx1 + _BTN_PAD) and
+            (_rbx0 - _BTN_PAD) <= _restart_tip_out[0] <= (_rbx1 + _BTN_PAD) and
             (_rby0 - _BTN_PAD) <= _restart_tip_out[1] <= (_rby1 + _BTN_PAD)
         )
-        if _hovering_restart:
-            _restart_frames = min(_RESTART_FRAMES, _restart_frames + 1)
-        else:
-            _restart_frames = max(0, _restart_frames - 4)
 
-        _restart_frac = _restart_frames / _RESTART_FRAMES
+        pinch_dist = hand_state.get("pinch_dist", 1.0)
 
-        if _restart_frac > 0:
-            _rb_ov = vis_display.copy()
-            cv2.rectangle(_rb_ov, (_rbx0, _rby0), (_rbx1, _rby1),
-                          (255, 255, 255), -1)
-            cv2.addWeighted(_rb_ov, _restart_frac * 0.85,
-                            vis_display, 1.0 - _restart_frac * 0.85,
-                            0, vis_display)
-        from PIL import Image as _FI, ImageDraw as _FD
-        _fimg = _FI.fromarray(cv2.cvtColor(vis_display, cv2.COLOR_BGR2RGB)).convert('RGBA')
-        _fdraw = _FD.Draw(_fimg)
-        _fdraw.rounded_rectangle(
-            [_rbx0, _rby0, _rbx1, _rby1],
-            radius=_RESTART_CORNER,
-            fill=None,
-            outline=(255, 255, 255, 230),
-            width=_RESTART_OUTLINE,
+        # ── Brush / Drag hover detection ────────────────────────────────
+        _MODE_BTN_PAD = 40
+
+        _hovering_brush = (
+            _restart_tip_out is not None and
+            (brush_x0 - _MODE_BTN_PAD) <= _restart_tip_out[0] <= (brush_x1 + _MODE_BTN_PAD) and
+            (brush_y0 - _MODE_BTN_PAD) <= _restart_tip_out[1] <= (brush_y1 + _MODE_BTN_PAD)
         )
-        _ffont = _finish_font
-        _lbl = 'Finish'
-        _btn_cx = (_rbx0 + _rbx1) // 2
-        _btn_cy = (_rby0 + _rby1) // 2
-        _lbl_col = (0, 0, 0, 255) if _restart_frac > 0.5 else (255, 255, 255, 255)
-        _fdraw.text((_btn_cx + 2, _btn_cy + 2), _lbl, font=_ffont,
-                    fill=(0, 0, 0, 180), anchor='mm')
-        _fdraw.text((_btn_cx, _btn_cy), _lbl, font=_ffont,
-                    fill=_lbl_col, anchor='mm')
-        vis_display = cv2.cvtColor(np.array(_fimg.convert('RGB')), cv2.COLOR_RGB2BGR)
 
-        if _restart_tip_out is not None and _hand_near_button:
-            cv2.circle(vis_display, _restart_tip_out, 14,
-                       (255, 255, 255), -1, cv2.LINE_AA)
-            cv2.circle(vis_display, _restart_tip_out, 14,
-                       (180, 180, 255),  2, cv2.LINE_AA)
+        _hovering_drag = (
+            _restart_tip_out is not None and
+            (drag_x0 - _MODE_BTN_PAD) <= _restart_tip_out[0] <= (drag_x1 + _MODE_BTN_PAD) and
+            (drag_y0 - _MODE_BTN_PAD) <= _restart_tip_out[1] <= (drag_y1 + _MODE_BTN_PAD)
+        )
 
-        if _restart_frames >= _RESTART_FRAMES:
+        if _mode_click_cooldown > 0:
+            _mode_click_cooldown -= 1
+
+        mode_pinch_click = (
+            hand_state.get("detected", False)
+            and (_hovering_brush or _hovering_drag)
+            and _mode_click_cooldown <= 0
+            and _finish_prev_pinch_dist > _FINISH_PINCH_OPEN_DIST
+            and pinch_dist < _FINISH_PINCH_CLOSED_DIST
+            and (_finish_prev_pinch_dist - pinch_dist) > _FINISH_PINCH_DROP_MIN
+            and not _timeout_fired
+        )
+
+        if mode_pinch_click:
+            if _hovering_brush:
+                interaction_mode = "brush"
+            elif _hovering_drag:
+                interaction_mode = "drag"
+                _drag_ui_timer = _DRAG_UI_DURATION
+
+            _mode_click_cooldown = _FINISH_CLICK_COOLDOWN
+
+        pinch_click = (
+            hand_state.get("detected", False)
+            and _hovering_restart
+            and _finish_pinch_click_cooldown <= 0
+            and _finish_prev_pinch_dist > _FINISH_PINCH_OPEN_DIST
+            and pinch_dist < _FINISH_PINCH_CLOSED_DIST
+            and (_finish_prev_pinch_dist - pinch_dist) > _FINISH_PINCH_DROP_MIN
+            and not _timeout_fired
+        )
+
+        if _finish_pinch_click_cooldown > 0:
+            _finish_pinch_click_cooldown -= 1
+
+        if pinch_click:
+            _finish_pinch_click_cooldown = _FINISH_CLICK_COOLDOWN
+
+        _finish_prev_pinch_dist = pinch_dist
+
+
+        # ── Choose button state ──────────────────────────────────────────
+        if not _timeout_fired:
+            if pinch_click:
+                btn_img = finish_btn_click
+            elif _hovering_restart:
+                btn_img = finish_btn_hover
+            else:
+                btn_img = finish_btn_normal
+
+
+            # ── Draw button ──────────────────────────────────────────────────
+            vis_display = overlay_bgra(vis_display, btn_img, _rbx0, _rby0)
+
+            # ── Draw brush / drag buttons ───────────────────────────────────
+            if interaction_mode == "brush":
+                brush_img = brush_btn_click
+            elif _hovering_brush:
+                brush_img = brush_btn_hover
+            else:
+                brush_img = brush_btn_normal
+
+            if interaction_mode == "drag":
+                drag_img = drag_btn_click
+            elif _hovering_drag:
+                drag_img = drag_btn_hover
+            else:
+                drag_img = drag_btn_normal
+
+            vis_display = overlay_bgra(vis_display, brush_img, brush_x0, brush_y0)
+            vis_display = overlay_bgra(vis_display, drag_img, drag_x0, drag_y0)
+
+            if _hovering_brush:
+                vis_display = draw_pinch_hint_under_button(
+                    vis_display, pinch_icon, brush_x0, brush_y1, _MODE_BTN_W
+                )
+
+            if _hovering_drag:
+                vis_display = draw_pinch_hint_under_button(
+                    vis_display, pinch_icon, drag_x0, drag_y1, _MODE_BTN_W
+                )
+
+            if interaction_mode == "brush":
+                # ── MUCH bigger pinch icon ───────────────────────────────────
+                icon_scale = 2.4   # ↑ bigger than before (was ~1.6)
+
+                if pinch_icon is not None:
+                    big_icon = cv2.resize(
+                        pinch_icon,
+                        (int(pinch_icon.shape[1] * icon_scale),
+                        int(pinch_icon.shape[0] * icon_scale)),
+                        interpolation=cv2.INTER_LINEAR
+                    )
+                else:
+                    big_icon = None
+
+                # ── Position (left edge, slightly lower for breathing room) ──
+                base_x = 30
+                base_y = brush_y1 + 90   # push down a bit
+
+                if big_icon is not None:
+                    vis_display = overlay_bgra(vis_display, big_icon, base_x, base_y)
+
+                # ── Larger, more spaced text ─────────────────────────────────
+                lines = ["Pinch", "Unpinch", "Hold"]
+
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 1.05     # ↑ bigger text
+                thickness = 3         # ↑ thicker for readability
+                line_gap = 75         # ↑ much more spacing
+
+                text_x = base_x
+                text_y = base_y + (big_icon.shape[0] if big_icon is not None else 0) + 75
+
+                for i, line in enumerate(lines):
+                    y = text_y + i * line_gap
+
+                    # shadow
+                    cv2.putText(
+                        vis_display,
+                        line,
+                        (text_x + 3, y + 3),
+                        font,
+                        font_scale,
+                        (0, 0, 0),
+                        thickness + 2,
+                        cv2.LINE_AA
+                    )
+
+                    # main text
+                    cv2.putText(
+                        vis_display,
+                        line,
+                        (text_x, y),
+                        font,
+                        font_scale,
+                        (255, 255, 255),
+                        thickness,
+                        cv2.LINE_AA
+                    )
+
+            if interaction_mode == "drag" and _drag_ui_timer > 0:
+                # ── Fade factor ─────────────────────────────────────────────
+                alpha = (_drag_ui_timer / _DRAG_UI_DURATION) ** 1.5
+
+                drag_steps = [
+                    (open_palm_icon, "Hover over your body"),
+                    (fist_icon, "Slowly make a fist"),
+                    (fist_drag_icon, "Slowly drag away"),
+                    (open_palm_icon, "Let go"),
+                ]
+
+                icon_h = 95
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.9
+                thickness = 3
+
+                base_x = 30
+                base_y = brush_y1 + 90
+                row_gap = 95
+                icon_text_gap = 22
+
+                for i, (icon, text) in enumerate(drag_steps):
+                    y = base_y + i * row_gap
+
+                    if icon is not None:
+                        scale = icon_h / icon.shape[0]
+                        icon_resized = cv2.resize(
+                            icon,
+                            (int(icon.shape[1] * scale), icon_h),
+                            interpolation=cv2.INTER_AREA
+                        )
+
+                        # ── Apply fade to icon ───────────────────────────────
+                        if icon_resized.shape[2] == 4:
+                            icon_resized = icon_resized.copy()
+                            icon_resized[:, :, 3] = (
+                                icon_resized[:, :, 3].astype(np.float32) * alpha
+                            ).astype(np.uint8)
+
+                        vis_display = overlay_bgra(vis_display, icon_resized, base_x, y)
+                        text_x = base_x + icon_resized.shape[1] + icon_text_gap
+                    else:
+                        text_x = base_x
+
+                    text_y = y + icon_h // 2 + 12
+
+                    # ── Text colors with fade ───────────────────────────────
+                    text_color = (
+                        int(255 * alpha),
+                        int(255 * alpha),
+                        int(255 * alpha)
+                    )
+
+                    shadow_color = (
+                        int(0 * alpha),
+                        int(0 * alpha),
+                        int(0 * alpha)
+                    )
+
+                    # shadow
+                    cv2.putText(
+                        vis_display,
+                        text,
+                        (text_x + 3, text_y + 3),
+                        font,
+                        font_scale,
+                        shadow_color,
+                        thickness + 2,
+                        cv2.LINE_AA
+                    )
+
+                    # main text
+                    cv2.putText(
+                        vis_display,
+                        text,
+                        (text_x, text_y),
+                        font,
+                        font_scale,
+                        text_color,
+                        thickness,
+                        cv2.LINE_AA
+                    )
+
+            if _hovering_restart:
+                hint_text = "Pinch to click"
+
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.8
+                thickness = 2
+
+                (tw, th), baseline = cv2.getTextSize(hint_text, font, font_scale, thickness)
+
+                gap = 10
+                icon_gap = 8
+
+                icon_w = pinch_icon.shape[1] if pinch_icon is not None else 0
+                icon_h = pinch_icon.shape[0] if pinch_icon is not None else 0
+
+                total_w = icon_w + icon_gap + tw
+
+                group_x = _rbx0 + (_RESTART_W - total_w) // 2
+                group_y = _rby1 + gap
+
+                icon_x = group_x
+                icon_y = group_y
+
+                text_x = group_x + icon_w + icon_gap
+                text_y = group_y + (icon_h + th) // 2
+
+                if pinch_icon is not None:
+                    vis_display = overlay_bgra(vis_display, pinch_icon, icon_x, icon_y)
+
+                cv2.putText(
+                    vis_display,
+                    hint_text,
+                    (text_x + 2, text_y + 2),
+                    font,
+                    font_scale,
+                    (0, 0, 0),
+                    thickness + 1,
+                    cv2.LINE_AA
+                )
+
+                cv2.putText(
+                    vis_display,
+                    hint_text,
+                    (text_x, text_y),
+                    font,
+                    font_scale,
+                    (255, 255, 255),
+                    thickness,
+                    cv2.LINE_AA
+                )
+
+
+            # ── Optional pointer visual ──────────────────────────────────────
+            if _restart_tip_out is not None and _hand_near_button:
+                cv2.circle(vis_display, _restart_tip_out, 14,
+                        (255, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(vis_display, _restart_tip_out, 14,
+                        (180, 180, 255), 2, cv2.LINE_AA)
+
+
+        # ── Trigger action ───────────────────────────────────────────────
+        if pinch_click:
             print("Finish triggered — returning to welcome screen")
             return "restart"
+        
+        if _drag_ui_timer > 0:
+            _drag_ui_timer -= 1
 
         cv2.imshow(window_name, vis_display)
 
@@ -2670,7 +3203,7 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
             # to fill OUTPUT_H * 0.80 as a reasonable default — it will look
             # the same every session since the pose image is fixed.
             _ip_src_h = _init_pose_raw.shape[0]
-            _ip_target_h = int(OUTPUT_H * 0.80)
+            _ip_target_h = int(OUTPUT_H * 0.90)
             _ip_target_w = int(_init_pose_raw.shape[1] * _ip_target_h / _ip_src_h)
             _init_pose_img = cv2.resize(_init_pose_raw,
                                         (_ip_target_w, _ip_target_h),
@@ -2740,14 +3273,14 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
                 print("Set CAPTURE_BACKGROUND_BEFORE_INIT=True once to create it.")
                 interaction_state["bg_plate"] = None
 
-        show_countdown(cap, h, w, 5, "Initialization starting", window_name)
+        show_countdown(cap, h, w, 5, "Please match the pose displayed on the screen.\n\nInitialization starting", window_name, bs_img=_init_pose_img)
         print("Entering initialization loop")
 
         initialized=False; max_init_frames=300; full_pose_streak=0; required_streak=20
         mask_accum=None; mask_count=0; best_stable_pts=None
 
         # ── CHANGE 3: instruction line shown above countdown during init ──
-        _INIT_INSTRUCTION = "Please match the pose displayed on the screen."
+        _INIT_INSTRUCTION = "Hold still."
 
         for k in range(max_init_frames):
             ok, fr = cap.read()
@@ -2771,7 +3304,7 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
 
             init_vis = fr.copy()
             # ── CHANGE 1: no frame counter in status msg ──────────────────
-            status_msg = f"Waiting for full-body pose... streak={full_pose_streak}/{required_streak}"
+            status_msg = f"Waiting for full-body pose..."
 
             if full_pose_streak >= required_streak and mask_count > 0 and best_stable_pts is not None:
                 agg_mask = finalize_init_mask(mask_accum, mask_count, avg_thresh=0.28,
