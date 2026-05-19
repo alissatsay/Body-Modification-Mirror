@@ -70,6 +70,18 @@ def capture_thread(cap, frame_queue):
             frame_queue.put(frame)
 
 
+# Maps digit keys 0-6 to their uGain values
+GAIN_PRESETS = {
+    ord('0'): 0.00,
+    ord('1'): 0.10,
+    ord('2'): 0.20,
+    ord('3'): 0.30,
+    ord('4'): 0.40,
+    ord('5'): 0.50,
+    ord('6'): 0.60,
+}
+
+
 def main():
     # ── tunables ──────────────────────────────────────────────────────────────
     uGain             = 0.30
@@ -113,6 +125,7 @@ def main():
 
     print("\nControls:")
     print("  +  /  -   : increase / decrease uGain by 0.05")
+    print("  0 … 6     : set uGain directly (0.00, 0.10, 0.20, … 0.60)")
     print("  u  /  d   : increase / decrease uPeak by 0.05 (overrides pose tracking)")
     print("  q         : quit\n")
 
@@ -199,7 +212,7 @@ def main():
 
             # ── HUD overlay ───────────────────────────────────────────────────
             peak_label = f"{last_uPeakY:.2f}" + (" [manual]" if uPeakY_manual is not None else " [pose]")
-            cv2.putText(final_frame, f"uGain: {uGain:.2f}  (+/-)",
+            cv2.putText(final_frame, f"uGain: {uGain:.2f}  (+/- or 0-6)",
                         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             cv2.putText(final_frame, f"uPeak: {peak_label}  (u/d)",
                         (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
@@ -222,6 +235,11 @@ def main():
                 uGain = round(max(uGain - GAIN_STEP, 0.0), 4)
                 maps_dirty = True
                 print(f"uGain → {uGain:.2f}")
+
+            elif key in GAIN_PRESETS:
+                uGain = GAIN_PRESETS[key]
+                maps_dirty = True
+                print(f"uGain → {uGain:.2f}  [preset {chr(key)}]")
 
             elif key == ord('u'):
                 base = uPeakY_manual if uPeakY_manual is not None else last_uPeakY
