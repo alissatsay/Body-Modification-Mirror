@@ -212,10 +212,10 @@ def main():
 
             # ── HUD overlay ───────────────────────────────────────────────────
             peak_label = f"{last_uPeakY:.2f}" + (" [manual]" if uPeakY_manual is not None else " [pose]")
-            cv2.putText(final_frame, f"uGain: {uGain:.2f}  (+/- or 0-6)",
-                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.putText(final_frame, f"uPeak: {peak_label}  (u/d)",
-                        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            # cv2.putText(final_frame, f"uGain: {uGain:.2f}  (+/- or 0-6)",
+            #             (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            # cv2.putText(final_frame, f"uPeak: {peak_label}  (u/d)",
+            #             (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
             cv2.imshow("Warped Mirror over Captured Background", final_frame)
             frame_idx += 1
