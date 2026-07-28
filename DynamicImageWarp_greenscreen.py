@@ -9,7 +9,7 @@ mp_pose = mp.solutions.pose
 # --------------------------
 # Config
 # --------------------------
-NUM_PERS = 5
+NUM_PERS = 16
 
 IMAGES_DIR = "images_for_warping"
 WARPED_DIR = "warped_dataset_greenscreen"
