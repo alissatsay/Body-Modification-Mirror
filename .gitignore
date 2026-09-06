@@ -16,9 +16,8 @@ __pycache__/
 # Logs / outputs
 *.log
 
-# Optional: if you generate lots of output frames/videos, consider ignoring:
-# saved_frames/
-# outputs/
+# Generated demo/session output frames (regenerable by running the mirrors)
+saved_frames/
 
 # Generated warp-image datasets (regenerable via clinical_mirror/dataset_generation/*.py)
 images_for_warping/
