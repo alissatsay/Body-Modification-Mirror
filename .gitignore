@@ -19,3 +19,10 @@ __pycache__/
 # Optional: if you generate lots of output frames/videos, consider ignoring:
 # saved_frames/
 # outputs/
+
+# Generated warp-image datasets (regenerable via clinical_mirror/dataset_generation/*.py)
+images_for_warping/
+images_for_warping_greenscreen/
+warped_dataset/
+warped_dataset_greenscreen/
+warped_dataset_nobackground/

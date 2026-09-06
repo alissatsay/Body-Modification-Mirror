@@ -1,11 +1,36 @@
+"""
+clinical_mirror/dataset_generation/generate_still_warp.py
+
+Loads a single already-captured person + background image pair from
+disk (does not touch the webcam), applies one warp at U_GAIN, composites
+over the background via MediaPipe segmentation, and saves/shows the
+single result.
+
+Run from the Digital_Mirror_Code repo root (paths below are relative to
+the current working directory, same as the original script).
+
+Previously the top-level StillImageWarp.py -- only the imports and the
+now-shared helper functions changed.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
 import cv2
 import numpy as np
 import mediapipe as mp
-import os
+
+from helpers import (
+    build_warp_maps,
+    warp_frame,
+    get_hip_center_and_peakY_from_pose,
+    composite_person_over_bg,
+)
 
 mp_pose = mp.solutions.pose
 mp_selfie_segmentation = mp.solutions.selfie_segmentation
-
 
 NUM_PERS = 1
 PERSON_IMAGE_PATH = "images_for_warping/pers" + str(NUM_PERS) + ".png"
@@ -19,78 +44,7 @@ FEATHER_PX = 5       # Feathering radius
 MIRROR = False       # Selfie-style mirror
 
 
-
-def build_warp_maps(width, height, uCenterX, uPeakY, uGain, sigma_y=0.2):
-    x_norm = np.linspace(0.0, 1.0, width, dtype=np.float32)
-    y_norm = np.linspace(0.0, 1.0, height, dtype=np.float32)
-    xv_norm, yv_norm = np.meshgrid(x_norm, y_norm)
-
-    dy = (yv_norm - uPeakY) / max(sigma_y, 1e-6)
-    vertical_profile = np.exp(-(dy ** 2))
-
-    scale = 1.0 + uGain * vertical_profile
-    dx = xv_norm - uCenterX
-    srcx_norm = uCenterX + dx / scale
-
-    map_x = (srcx_norm * (width - 1)).astype(np.float32)
-    map_y = (yv_norm * (height - 1)).astype(np.float32)
-    return map_x, map_y
-
-
-def warp_frame(frame_bgr, map_x, map_y):
-    return cv2.remap(
-        frame_bgr, map_x, map_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REPLICATE
-    )
-
-
-
-def get_hip_center_and_peakY_from_pose(results):
-    if not results.pose_landmarks:
-        return None, None
-
-    lm = results.pose_landmarks.landmark
-    left_hip = lm[mp_pose.PoseLandmark.LEFT_HIP.value]
-    right_hip = lm[mp_pose.PoseLandmark.RIGHT_HIP.value]
-
-    uCenterX = 0.5 * (left_hip.x + right_hip.x)
-    uPeakY = 0.5 * (left_hip.y + right_hip.y) - 0.1
-
-    uCenterX = np.clip(uCenterX, 0.0, 1.0)
-    uPeakY = np.clip(uPeakY, 0.0, 1.0)
-
-    return uCenterX, uPeakY
-
-
-
-def composite_person_over_bg(person_bgr, seg_mask, bg_bgr):
-    h, w = person_bgr.shape[:2]
-
-    if bg_bgr.shape[:2] != (h, w):
-        bg_bgr = cv2.resize(bg_bgr, (w, h), interpolation=cv2.INTER_LINEAR)
-
-    bg_f32 = bg_bgr.astype(np.float32)
-
-    person_mask = (seg_mask >= SEG_THRESH).astype(np.float32)
-
-    if FEATHER_PX > 0:
-        k = max(1, int(FEATHER_PX))
-        if k % 2 == 0:
-            k += 1
-        person_mask = cv2.GaussianBlur(person_mask, (k, k), 0)
-
-    mask_3 = np.dstack([person_mask] * 3)
-
-    person_f32 = person_bgr.astype(np.float32)
-    out = mask_3 * person_f32 + (1.0 - mask_3) * bg_f32
-
-    return out.astype(np.uint8)
-
-
-
 def main():
-
     person_bgr = cv2.imread(PERSON_IMAGE_PATH)
     bg_bgr = cv2.imread(BACKGROUND_IMAGE_PATH)
 
@@ -135,7 +89,7 @@ def main():
         seg_results = segmenter.process(rgb_for_seg)
         seg_mask = seg_results.segmentation_mask
 
-        final = composite_person_over_bg(warped, seg_mask, bg_bgr)
+        final = composite_person_over_bg(warped, seg_mask, bg_bgr, thresh=SEG_THRESH, feather_px=FEATHER_PX)
 
     cv2.imwrite(OUTPUT_PATH, final)
     cv2.imshow("Warped Composite", final)
