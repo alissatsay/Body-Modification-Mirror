@@ -20,15 +20,6 @@ prototype in `proof_of_concept/` did start from the clinical mirror's code.
   the true final version (of several `fixed_mesh_*` candidates in the old
   `New_code/` folder) via git history and a function-by-function diff — see
   "What was consolidated" below.
-- **`arm_refinement_needs_review.py`** — **not yet resolved.** This file
-  (formerly `New_code/code_hand_refine (1).py`) has 5 functions
-  (`refine_arms_only_once`, `refine_mesh_conforming_once`,
-  `select_arm_refine_triangles`, `_sorted_edge`, `_triangle_split_pattern`)
-  implementing arm-specific mesh refinement that isn't in
-  `run_installation.py`. Alissa needs to check whether this was
-  intentionally dropped or just never merged back in, before this file is
-  either folded into the main pipeline or deleted. See the header comment
-  in the file itself.
 - **`helpers/`** — the shared building blocks `run_installation.py` is built
   on:
   - `triangle_mesh.py` — Delaunay triangulation, mesh warping/deformation
@@ -83,8 +74,11 @@ commit history plus a function-by-function diff:
   first, so that specific snapshot stays reachable by name).
 - **`fixed_mesh_fps_count.py`** and **`fixed_mesh_pixel_remap.py`** — earlier
   experimental variants, superseded — removed.
-- **`code_hand_refine (1).py`** — see `arm_refinement_needs_review.py` above;
-  kept, not removed, pending Alissa's review.
+- **`code_hand_refine (1).py`** — had 5 arm-specific mesh-refinement functions
+  not present anywhere else (`refine_arms_only_once`,
+  `refine_mesh_conforming_once`, `select_arm_refine_triangles`,
+  `_sorted_edge`, `_triangle_split_pattern`). Reviewed and confirmed not
+  needed — removed.
 
 `New_code/` is now empty and no longer exists in the repo — everything that
 was in it has either moved here (with import paths and asset paths updated

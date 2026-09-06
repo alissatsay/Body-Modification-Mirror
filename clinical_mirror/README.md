@@ -80,8 +80,3 @@ image dataset, not for running a live mirror session:
 
 Run any of these from the repo root, the same way as `live_mirror.py`.
 
-## Not moved in here yet
-
-`New_code/` still holds a separate, more recent lineage of scripts (portrait
-rotation, stats/profiling) built for the actual pre-clinical study — that
-hasn't been folded into this structure yet.
