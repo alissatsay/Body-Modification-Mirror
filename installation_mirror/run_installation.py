@@ -9,14 +9,21 @@ from scipy.spatial import Delaunay
 
 mp_pose = mp.solutions.pose
 
-import Triangle_Mesh_helpers as TMh
-import Pose_Tracking_helpers as PTh
+_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "helpers"))
+
+import triangle_mesh as TMh
+
+import pose_tracking as PTh
 
 # Gesture tracker objects — created once, live for the whole session
 _peace_detector = PTh.PeaceSignHoldDetector()
 _pinch_tracker  = PTh.PinchGestureTracker()
-import Loop_helpers as Lh
-import Display_helpres as Dh
+import interaction_loop as Lh
+import display as Dh
 
 ROTATE_DEG = 270
 ROTATE_DIR = "ccw"
@@ -32,7 +39,7 @@ SEG_EVERY_N = 2
 WELCOME_SCREEN_DURATION = 6.0
 
 # Path to the welcome background image (relative to script or cwd).
-WELCOME_BG_PATH = "welcome_background.png"
+WELCOME_BG_PATH = os.path.join(_ASSETS_DIR, "welcome_background.png")
 
 # Animated gradient background
 # When True the captured/loaded bg_plate is replaced each frame by a
@@ -175,10 +182,10 @@ _MODE_BTN_MARGIN = 30
 _MODE_BTN_GAP = 20
 
 # ── Beauty-standard image directory ──────────────────────────────────────
-_BS_IMAGE_DIR = "beauty_standard_images"
+_BS_IMAGE_DIR = os.path.join(_ASSETS_DIR, "beauty_standard_images")
 
 # ── Initialization pose image ─────────────────────────────────────────────
-_INIT_POSE_PATH = os.path.join("UI_gestures", "initialization_pose.png")
+_INIT_POSE_PATH = os.path.join(_ASSETS_DIR, "UI_gestures", "initialization_pose.png")
 _INIT_POSE_ALPHA = 0.35   # same opacity as BS overlay
 
 SESSION_DURATION_SECONDS = 180.0   # 3 minutes per session
@@ -1686,14 +1693,10 @@ def finalize_init_mask(mask_accum, count, avg_thresh=0.30, dilate_ksize=11, clos
 
 
 def _resolve_beauty_standard_image_path(filename="beauty_standard.png"):
-    candidates = []
-    if "__file__" in globals():
-        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                        "beauty_standard_images", filename))
-    candidates.append(os.path.join(os.getcwd(), "beauty_standard_images", filename))
+    candidates = [os.path.join(_ASSETS_DIR, "beauty_standard_images", filename)]
     for p in candidates:
         if os.path.exists(p): return p
-    return candidates[0] if candidates else os.path.join("beauty_standard_images", filename)
+    return candidates[0]
 
 
 def load_beauty_standard_overlay(size=120, filename="beauty_standard.png"):
@@ -1827,7 +1830,7 @@ def _make_welcome_frame(bg_base, t, out_w, out_h):
     shimmer = (alpha[:, :, None] * shimmer_bgr[None, None, :]).astype(np.float32)
     frame_bgr = np.clip(bg_base.astype(np.float32) + shimmer, 0, 255).astype(np.uint8)
 
-    welcome_text_path = os.path.join("UI_gestures", "welcome_text.png")
+    welcome_text_path = os.path.join(_ASSETS_DIR, "UI_gestures", "welcome_text.png")
     welcome_text_img  = cv2.imread(welcome_text_path, cv2.IMREAD_UNCHANGED)
     if welcome_text_img is not None:
         if welcome_text_img.shape[:2] != (H, W):
@@ -2393,21 +2396,21 @@ def run_hand_brush_drag_arap_loop_skeleton(
     ARM_FRONT_SCORE_DEADBAND = 6.0
 
     # ── Finish button images (load once) ─────────────────────────────
-    finish_btn_normal = cv2.imread("buttons/finish.png", cv2.IMREAD_UNCHANGED)
-    finish_btn_hover  = cv2.imread("buttons/finish_hover.png", cv2.IMREAD_UNCHANGED)
-    finish_btn_click  = cv2.imread("buttons/finish_clicked.png", cv2.IMREAD_UNCHANGED)
+    finish_btn_normal = cv2.imread(os.path.join(_ASSETS_DIR, "buttons", "finish.png"), cv2.IMREAD_UNCHANGED)
+    finish_btn_hover  = cv2.imread(os.path.join(_ASSETS_DIR, "buttons", "finish_hover.png"), cv2.IMREAD_UNCHANGED)
+    finish_btn_click  = cv2.imread(os.path.join(_ASSETS_DIR, "buttons", "finish_clicked.png"), cv2.IMREAD_UNCHANGED)
 
     finish_btn_normal = cv2.resize(finish_btn_normal, (_RESTART_W, _RESTART_H))
     finish_btn_hover  = cv2.resize(finish_btn_hover,  (_RESTART_W, _RESTART_H))
     finish_btn_click  = cv2.resize(finish_btn_click,  (_RESTART_W, _RESTART_H))
 
-    brush_btn_normal = cv2.imread("buttons/brush.png", cv2.IMREAD_UNCHANGED)
-    brush_btn_hover  = cv2.imread("buttons/brush_hover.png", cv2.IMREAD_UNCHANGED)
-    brush_btn_click  = cv2.imread("buttons/brush_clicked.png", cv2.IMREAD_UNCHANGED)
+    brush_btn_normal = cv2.imread(os.path.join(_ASSETS_DIR, "buttons", "brush.png"), cv2.IMREAD_UNCHANGED)
+    brush_btn_hover  = cv2.imread(os.path.join(_ASSETS_DIR, "buttons", "brush_hover.png"), cv2.IMREAD_UNCHANGED)
+    brush_btn_click  = cv2.imread(os.path.join(_ASSETS_DIR, "buttons", "brush_clicked.png"), cv2.IMREAD_UNCHANGED)
 
-    drag_btn_normal = cv2.imread("buttons/drag.png", cv2.IMREAD_UNCHANGED)
-    drag_btn_hover  = cv2.imread("buttons/drag_hover.png", cv2.IMREAD_UNCHANGED)
-    drag_btn_click  = cv2.imread("buttons/drag_clicked.png", cv2.IMREAD_UNCHANGED)
+    drag_btn_normal = cv2.imread(os.path.join(_ASSETS_DIR, "buttons", "drag.png"), cv2.IMREAD_UNCHANGED)
+    drag_btn_hover  = cv2.imread(os.path.join(_ASSETS_DIR, "buttons", "drag_hover.png"), cv2.IMREAD_UNCHANGED)
+    drag_btn_click  = cv2.imread(os.path.join(_ASSETS_DIR, "buttons", "drag_clicked.png"), cv2.IMREAD_UNCHANGED)
 
     brush_btn_normal = cv2.resize(brush_btn_normal, (_MODE_BTN_W, _MODE_BTN_H))
     brush_btn_hover  = cv2.resize(brush_btn_hover,  (_MODE_BTN_W, _MODE_BTN_H))
@@ -2417,10 +2420,10 @@ def run_hand_brush_drag_arap_loop_skeleton(
     drag_btn_hover  = cv2.resize(drag_btn_hover,  (_MODE_BTN_W, _MODE_BTN_H))
     drag_btn_click  = cv2.resize(drag_btn_click,  (_MODE_BTN_W, _MODE_BTN_H))
 
-    pinch_icon = cv2.imread("UI_gestures/pinch.png", cv2.IMREAD_UNCHANGED)
-    open_palm_icon = cv2.imread("UI_gestures/open_palm.png", cv2.IMREAD_UNCHANGED)
-    fist_icon = cv2.imread("UI_gestures/fist.png", cv2.IMREAD_UNCHANGED)
-    fist_drag_icon = cv2.imread("UI_gestures/fist_drag.png", cv2.IMREAD_UNCHANGED)
+    pinch_icon = cv2.imread(os.path.join(_ASSETS_DIR, "UI_gestures", "pinch.png"), cv2.IMREAD_UNCHANGED)
+    open_palm_icon = cv2.imread(os.path.join(_ASSETS_DIR, "UI_gestures", "open_palm.png"), cv2.IMREAD_UNCHANGED)
+    fist_icon = cv2.imread(os.path.join(_ASSETS_DIR, "UI_gestures", "fist.png"), cv2.IMREAD_UNCHANGED)
+    fist_drag_icon = cv2.imread(os.path.join(_ASSETS_DIR, "UI_gestures", "fist_drag.png"), cv2.IMREAD_UNCHANGED)
 
     _PINCH_ICON_H = 42
     if pinch_icon is not None:
@@ -3259,7 +3262,7 @@ def test_hand_brush_drag_arap_live_skeleton(step=0, thresh=0.5, feather=0, show_
         inference_thread = PoseInferenceThread(pose=pose, hands=hands, segmenter=segmenter,
                                                 feather=feather, thresh=thresh, w=w, h=h)
 
-        _BG_DIR  = "background_captures"
+        _BG_DIR  = os.path.join(_ASSETS_DIR, "background_captures")
         _BG_PATH = os.path.join(_BG_DIR, "background.png")
 
         if CAPTURE_BACKGROUND_BEFORE_INIT:
