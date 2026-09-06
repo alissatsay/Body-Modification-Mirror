@@ -2,10 +2,14 @@
 
 import cv2
 import numpy as np
-import Triangle_Mesh_helpers as TMh
-import Pose_Tracking_helpers as PTh
-import Loop_helpers as Lh
-import Display_helpres as Dh
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helpers"))
+
+import triangle_mesh as TMh
+import pose_tracking as PTh
+import interaction_loop as Lh
+import display as Dh
 
 import mediapipe as mp
 mp_selfie_segmentation = mp.solutions.selfie_segmentation

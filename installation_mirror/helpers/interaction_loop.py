@@ -3,9 +3,9 @@ import numpy as np
 import mediapipe as mp
 import time
 
-import Pose_Tracking_helpers as PTh
-import Triangle_Mesh_helpers as TMh
-import Display_helpres as Dh
+import pose_tracking as PTh
+import triangle_mesh as TMh
+import display as Dh
 
 def run_hand_brush_drag_loop_pose(
     cap,
