@@ -1,19 +1,52 @@
+"""
+Hand-gesture gain control -- proof of concept
+
+Pilot prototype that took the clinical warp-mirror pipeline (see
+clinical_mirror/) and added: hold both hands open and still for ~2s to
+"arm" gesture control, then move your hands apart/together to live-adjust
+the warp gain (uGain). This was the first proof that the mirror's warp
+strength could be driven by a simple two-hand gesture instead of only
+keyboard presets, and it fed directly into the gesture-driven interaction
+model used in the full installation (installation_mirror/).
+
+Consolidated from 6 near-duplicate experimental scripts
+(New_code/GLSLwarpCombinationBackground.py, GLSL_CB_rotated_HT.py,
+GLSL_HT.py, GLSL_HT_Stats.py, GLSL_HT_Stats_Optimized.py, GLSL_HT_UI)
+during the 2026-09 repo reorg. This file keeps the most fully-featured
+version (palm-circle UI with a charge-up ring, two-open-hands arming
+gesture, fullscreen deployment on a second display). The other line of
+that experiment -- an FPS-instrumented, performance-optimized variant --
+is kept separately as hand_gesture_gain_control_optimized.py since it
+demonstrates a genuinely different technique (frame decimation,
+precomputed warp-map buffers) worth keeping as reference.
+
+ORIENTATION below controls both the camera-frame rotation and the output
+aspect ratio, so this same file can demo on a vertical (portrait) or
+horizontal (landscape) screen without code changes.
+"""
+
 import cv2
 import numpy as np
 import mediapipe as mp
 import time
 
+# ── Orientation: pick how this will be displayed ─────────────────────────
+ORIENTATION = "vertical"  # "vertical" or "horizontal"
 
-ROTATE_DEG = 90                
-ROTATE_DIR = "ccw"              # "ccw" or "cw"
-OUTPUT_W = 2160
-OUTPUT_H = 3840
+if ORIENTATION == "vertical":
+    ROTATE_DEG = 90
+    ROTATE_DIR = "ccw"           # "ccw" or "cw"
+    OUTPUT_W, OUTPUT_H = 2160, 3840
+else:
+    ROTATE_DEG = 0
+    ROTATE_DIR = "ccw"
+    OUTPUT_W, OUTPUT_H = 3840, 2160
 
-PRIMARY_MONITOR_WIDTH = 1920 
+PRIMARY_MONITOR_WIDTH = 1920
 WINDOW_NAME = "Warped Mirror"
 
 
-OPEN_HAND_REQUIRE_EXTENDED = 4  
+OPEN_HAND_REQUIRE_EXTENDED = 4
 
 IDLE_COLOR = (247, 94, 77)          # BGR
 IDLE_FILL_ALPHA = 0.22
