@@ -1,3 +1,14 @@
+"""
+Pose/hand tracking and skeleton-frame geometry for run_installation.py:
+hand-gesture detection (open palm, peace sign, pinch, each with its own
+hold-duration tracker class), person segmentation, pose/body bounding
+boxes, and the torso/segment reference-frame math (build_segment_frames,
+localize/world_from_local_in_frame, bind_mesh_to_skeleton's helpers) the
+mesh in triangle_mesh.py is tracked against. Also owns the pose-landmark
+and segment name tables (POSE_IDS, TRACKED_POSE_NAMES,
+REQUIRED_INIT_LANDMARKS).
+"""
+
 import cv2
 import numpy as np
 import mediapipe as mp

@@ -268,20 +268,6 @@ def get_hip_center_and_peakY_from_pose(results, vis_thresh=0.6):
     uPeakY = 0.5 * (left_hip.y + right_hip.y) - 0.1
     return clamp(uCenterX, 0.0, 1.0), clamp(uPeakY, 0.0, 1.0)
 
-def get_index_y_from_pose(results, vis_thresh=0.6):
-    if not results or not results.pose_landmarks:
-        return None
-    lm = results.pose_landmarks.landmark
-    candidates = []
-    for idx in [mp_pose.PoseLandmark.RIGHT_INDEX.value,
-                mp_pose.PoseLandmark.LEFT_INDEX.value]:
-        pt = lm[idx]
-        if pt.visibility >= vis_thresh:
-            candidates.append(pt.y)
-    if not candidates:
-        return None
-    return clamp(min(candidates), 0.0, 1.0)
-
 def get_hand_distance_from_pose(results, vis_thresh=0.6, use_wrist=False):
     if not results or not results.pose_landmarks:
         return None
@@ -493,16 +479,13 @@ def main():
 
     fallback_centerX = 0.5
     fallback_peakY = 0.55
-    fallback_index_y_norm = 0.5
 
     prev_centerX = None
     prev_peakY = None
-    prev_indexY = None
 
     alpha_pose = 0.15
     max_step_x = 0.03
     max_step_y = 0.03
-    max_step_idx = 0.05
 
     vis_thresh = 0.6
 
@@ -617,12 +600,6 @@ def main():
             uCenterX = ema(prev_centerX, uCenterX_raw, alpha_pose)
             uPeakY = ema(prev_peakY, uPeakY_raw, alpha_pose)
             prev_centerX, prev_peakY = uCenterX, uPeakY
-
-            index_y_raw = get_index_y_from_pose(pose_results, vis_thresh=vis_thresh)
-            if index_y_raw is None:
-                index_y_raw = prev_indexY if prev_indexY is not None else fallback_index_y_norm
-            index_y_raw = clamp_delta(prev_indexY, index_y_raw, max_step_idx)
-            prev_indexY = ema(prev_indexY, index_y_raw, alpha_pose)
 
             hand_dist = get_hand_distance_from_pose(pose_results, vis_thresh=vis_thresh, use_wrist=False)
             STATS.add("hand_dist_ok", 1.0 if (hand_dist is not None) else 0.0)

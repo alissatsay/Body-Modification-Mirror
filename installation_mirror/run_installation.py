@@ -1,3 +1,19 @@
+"""
+Entry point for the Reshape Repeat installation: run `python
+run_installation.py` to start the live demo (welcome screen -> beauty-
+standard selection -> background capture -> pose/hand-tracked mesh
+sculpting session -> back to welcome on finish or a 3-minute timeout).
+
+This file only holds what's genuinely specific to that outer loop --
+main() (the loop above, plus per-session initialization: building the
+adaptive body mesh and binding it to the tracked skeleton) and
+PoseInferenceThread (the background thread that keeps pose/hand/
+segmentation inference off the render loop's critical path). Everything
+else (mesh geometry, pose tracking, screens, the interaction loop itself)
+lives in helpers/ -- see installation_mirror/README.md for the full
+breakdown.
+"""
+
 import os
 import cv2
 import numpy as np

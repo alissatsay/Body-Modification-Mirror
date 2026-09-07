@@ -21,14 +21,15 @@ back to idle.
   UI (idle/active color states, charge-up ring), two-open-hands arming
   gesture, fullscreen deployment on a second display.
 - **`hand_gesture_gain_control_optimized.py`** — a performance-tuned variant
-  of the same pilot: processes at a lower internal resolution, precomputes
-  and reuses warp-map buffers instead of rebuilding them every frame,
-  decimates the pose/hands/segmentation models (runs them every N frames
-  and reuses the last result), and uses uint8 bitwise compositing instead
-  of float32 blending. It also prints a rolling FPS/percentile breakdown
-  every ~2 seconds — useful for tuning frame rate on real hardware. Kept
-  separately because it demonstrates a genuinely different technique, not
-  because it's a duplicate.
+  of the same pilot: processes and displays at a lower resolution (1080x1920
+  vertical / 1920x1080 horizontal, vs. the primary file's 4K 2160x3840 /
+  3840x2160), precomputes and reuses warp-map buffers instead of rebuilding
+  them every frame, decimates the pose/hands/segmentation models (runs them
+  every N frames and reuses the last result), and uses uint8 bitwise
+  compositing instead of float32 blending. It also prints a rolling
+  FPS/percentile breakdown every ~2 seconds — useful for tuning frame rate
+  on real hardware. Kept separately because it demonstrates a genuinely
+  different technique, not because it's a duplicate.
 
 Both files are self-contained (they don't import from `clinical_mirror/` or
 `../helpers/`) since they're historical snapshots of an experiment rather

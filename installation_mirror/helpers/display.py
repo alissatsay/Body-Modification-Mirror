@@ -1,3 +1,10 @@
+"""
+Output-frame display helpers for run_installation.py: rotating a camera
+frame to match the installation's physical screen orientation
+(rotate_frame_for_output) and setting up/showing the fullscreen window on
+the second monitor the mesh is displayed on.
+"""
+
 import cv2
 
 PRIMARY_MONITOR_WIDTH = 1920

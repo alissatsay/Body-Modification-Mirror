@@ -1,3 +1,14 @@
+"""
+Triangle-mesh geometry for run_installation.py: building the body mesh
+(fixed grid or adaptive, bound to the tracked skeleton), warping/
+reconstructing it every frame (vectorized "vectorized"/"from_skeleton"
+variants, ARAP-based drag deformation), and rendering it back over the
+background (piecewise warping, per-render-group layering with yaw-based
+draw-order overrides, mask/overlay debug drawing). Also owns the
+segment/render-group name tables and layering config that this geometry
+is organized around.
+"""
+
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -8,16 +19,6 @@ from scipy.spatial import Delaunay
 
 from helpers import pose_tracking as PTh
 
-
-state = {
-    "dragging": False,
-    "prev_hand_center": None,
-    "hand_was_open": False,
-    "preview_vertices": ...,
-    "preview_triangles": ...,
-    "drag_vertices": ...,
-    "drag_triangles": ...,
-}
 
 def warp_triangle(src_img, dst_img, t_src, t_dst):
     """

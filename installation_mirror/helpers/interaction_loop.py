@@ -1,3 +1,14 @@
+"""
+The main per-frame interaction loops for run_installation.py: brush/drag
+mesh sculpting driven by hand gestures, in four variants (pose-tracked vs.
+plain-tracked mesh, with and without ARAP deformation) plus the full
+skeleton-mesh version used by the live pipeline
+(run_hand_brush_drag_arap_loop_skeleton), which also owns the finish/
+brush/drag button UI, the beauty-standard-timeout overlay, and the
+gesture/session config (brush radius, button geometry, session length)
+that only it uses.
+"""
+
 import os
 import cv2
 import numpy as np
@@ -1541,13 +1552,6 @@ def run_hand_brush_drag_arap_loop_skeleton(
             _rx = int(hand_center[0] * OUTPUT_W / w)
             _ry = int(hand_center[1] * OUTPUT_H / h)
             _restart_tip_out = (_rx, _ry)
-            if not hasattr(run_hand_brush_drag_arap_loop_skeleton, '_dbg'):
-                run_hand_brush_drag_arap_loop_skeleton._dbg = 0
-            run_hand_brush_drag_arap_loop_skeleton._dbg += 1
-            if run_hand_brush_drag_arap_loop_skeleton._dbg % 90 == 0:
-                print(f'[BTN] hand_out={_restart_tip_out} zone=[{_rbx0-200}-{_rbx1+200}, {_rby0-200}-{_rby1+200}]')
-            if _rx < 0 or _rx > OUTPUT_W or _ry < 0 or _ry > OUTPUT_H:
-                pass
 
         active_hand  = interaction_state.get("active_hand", None)
         hand_allowed = (
@@ -1615,7 +1619,6 @@ def run_hand_brush_drag_arap_loop_skeleton(
                 dy = hand_center[1] - interaction_state["prev_hand_center"][1]
                 interaction_state["prev_hand_center"] = hand_center
                 if abs(dx) >= 1 or abs(dy) >= 1:
-                    print("dx dy:", dx, dy)
                     V_new = TMh.apply_arap_drag_step_2(
                         V_track=V_track, V_def=V_def, T=T, active_triangles=active,
                         drag_vertices=interaction_state["drag_vertices"],

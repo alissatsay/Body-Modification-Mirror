@@ -119,6 +119,14 @@ knowing if you're reading the diff:
 - `OUTPUT_W`/`OUTPUT_H` are still owned by `run_installation.py`, which
   injects them into `helpers/screens.py` and `helpers/interaction_loop.py`
   right after importing (`Sc.OUTPUT_W = OUTPUT_W`, etc.).
+- Every cross-module import (here and inside `helpers/*.py`'s own
+  imports of each other) is `from helpers import triangle_mesh as TMh`
+  rather than a bare `import triangle_mesh as TMh` — `helpers/` is a real
+  package now (`helpers/__init__.py`), and `sys.path` gets the package's
+  parent (`installation_mirror/`) rather than `helpers/` itself. Doing
+  this everywhere at once (not just in `run_installation.py`) matters:
+  mixing the two styles would load two separate copies of a module in
+  the same process and silently break the shared state described above.
 - The file previously had its own `rotate_frame()`, a byte-for-byte
   duplicate of `display.py`'s `rotate_frame_for_output()` but with a
   *different* default rotation (270°/ccw vs. 90°/ccw). It's been removed;
@@ -139,3 +147,33 @@ knowing if you're reading the diff:
   `triangle_mesh.py` with the same values (0.020/6.0/0.015/8.0) so the
   functions are callable; worth double-checking those are the values you
   actually want.
+
+## Cleanup sweep
+
+A follow-up pass looking for stale references, dead code, and missing
+documentation across the whole repo. In `installation_mirror/`:
+
+- Added a module-level docstring to `run_installation.py` and each
+  pre-existing `helpers/*.py` file (`triangle_mesh.py`, `pose_tracking.py`,
+  `interaction_loop.py`, `display.py`) summarizing what it owns —
+  `screens.py` already had one from when it was created.
+- Removed dead code found while reading through everything: an unused
+  module-level `state = {...}` dict in `triangle_mesh.py` (every real
+  caller already passes its own `interaction_state` dict as a parameter —
+  this one was never read), a debug-only frame counter + `[BTN] ...` print
+  and a bare per-frame `print("dx dy:", dx, dy)` in
+  `interaction_loop.py`'s main loop, and a large (~320-line) unreachable
+  block in `tests/manual_visual_checks.py` — an earlier `test_hand_brush_
+  drag_live` definition (plus two helper functions only it used) that was
+  silently shadowed by a second, later definition of the same name and so
+  could never actually run; also cleaned up a stale commented-out
+  `GLSL_HT_UI` reference and a duplicate `mp_selfie_segmentation`
+  assignment in that same test file.
+- `proof_of_concept/`'s two files each computed an index-finger-position
+  value (`get_index_y_from_pose` → `index_y_raw`/`prev_indexY`) every
+  frame that was never actually used anywhere downstream — removed in
+  both files. Also corrected `proof_of_concept/README.md`'s description of
+  the optimized file: it displays at 1080x1920/1920x1080, not just "a
+  lower internal resolution" — a real (half-linear-resolution) difference
+  from the primary file's 4K output, not only an internal processing
+  detail.
