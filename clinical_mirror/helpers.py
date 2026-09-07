@@ -29,7 +29,7 @@ mp_selfie_segmentation = mp.solutions.selfie_segmentation
 # Core warp math
 # ---------------------------------------------------------------------------
 
-def build_warp_maps(width, height, uCenterX, uPeakY, uGain, sigma_y=0.2):
+def build_warp_maps(width, height, uCenterX, uPeakY, uGain, sigma_y=0.30):
     """
     Build the remap grids (map_x, map_y) that tell cv2.remap() where to
     sample the source image for each output pixel: a Gaussian-weighted
@@ -108,6 +108,7 @@ def get_index_y_from_pose(results):
     None if unavailable. One of two "cut line" strategies used by the
     combination-background mode (see also get_lowest_hand_related_y_from_pose,
     which live_mirror.py uses by default as the more robust of the two).
+    Kept for reference/future tuning — not currently called anywhere.
     """
     if not results.pose_landmarks:
         return None

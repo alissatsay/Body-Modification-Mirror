@@ -21,7 +21,6 @@ saved_frames/
 
 # Generated warp-image datasets (regenerable via clinical_mirror/dataset_generation/*.py)
 images_for_warping/
-images_for_warping_greenscreen/
 warped_dataset/
 warped_dataset_greenscreen/
 warped_dataset_nobackground/

@@ -7,7 +7,7 @@ MediaPipe segmentation), then batch-warps the keyed person across a
 sweep of uGain values, compositing each over the captured background.
 Writes the full uGain sweep to WARPED_DIR.
 
-Run from the Digital_Mirror_Code repo root (paths below are relative to
+Run from the repo root (paths below are relative to
 the current working directory, same as the original script).
 
 Previously the top-level DynamicImageWarp_greenscreen.py -- only the

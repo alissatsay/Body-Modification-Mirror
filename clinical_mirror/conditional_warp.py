@@ -14,7 +14,6 @@ Old_code/GLSL_conditional.py -- only the imports changed.
 """
 
 import cv2
-import numpy as np
 import mediapipe as mp
 
 from helpers import (

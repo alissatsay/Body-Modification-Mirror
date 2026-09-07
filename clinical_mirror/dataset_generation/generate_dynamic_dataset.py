@@ -6,7 +6,7 @@ the person across a sweep of uGain values, compositing each over the
 captured background via MediaPipe segmentation. Writes the full uGain
 sweep to WARPED_DIR.
 
-Run from the Digital_Mirror_Code repo root (paths below are relative to
+Run from the repo root (paths below are relative to
 the current working directory, same as the original script).
 
 Previously the top-level DynamicImageWarp.py -- only the imports and the
@@ -19,7 +19,6 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import cv2
-import numpy as np
 import mediapipe as mp
 
 from helpers import (

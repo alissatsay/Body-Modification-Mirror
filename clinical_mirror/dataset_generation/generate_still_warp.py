@@ -2,11 +2,11 @@
 clinical_mirror/dataset_generation/generate_still_warp.py
 
 Loads a single already-captured person + background image pair from
-disk (does not touch the webcam), applies one warp at U_GAIN, composites
+disk (does not touch the webcam), applies one warp at UGAIN, composites
 over the background via MediaPipe segmentation, and saves/shows the
 single result.
 
-Run from the Digital_Mirror_Code repo root (paths below are relative to
+Run from the repo root (paths below are relative to
 the current working directory, same as the original script).
 
 Previously the top-level StillImageWarp.py -- only the imports and the
@@ -19,7 +19,6 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import cv2
-import numpy as np
 import mediapipe as mp
 
 from helpers import (
@@ -37,7 +36,7 @@ PERSON_IMAGE_PATH = "images_for_warping/pers" + str(NUM_PERS) + ".png"
 BACKGROUND_IMAGE_PATH = "images_for_warping/pers" + str(NUM_PERS) + "bg.png"
 OUTPUT_PATH = "images_for_warping/pers" + str(NUM_PERS) + "W.png"
 
-U_GAIN = 0.30        # Warp strength
+UGAIN = 0.30        # Warp strength
 SIGMA_Y = 0.30       # Vertical spread of warp
 SEG_THRESH = 0.5     # Segmentation threshold
 FEATHER_PX = 5       # Feathering radius
@@ -82,7 +81,7 @@ def main():
             uCenterX = fallback_centerX
             uPeakY = fallback_peakY
 
-        map_x, map_y = build_warp_maps(w, h, uCenterX, uPeakY, U_GAIN, SIGMA_Y)
+        map_x, map_y = build_warp_maps(w, h, uCenterX, uPeakY, UGAIN, SIGMA_Y)
         warped = warp_frame(pose_input, map_x, map_y)
 
         rgb_for_seg = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
