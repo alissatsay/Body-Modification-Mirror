@@ -6,7 +6,7 @@ from scipy import sparse
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import Delaunay
 
-import pose_tracking as PTh
+from helpers import pose_tracking as PTh
 
 
 state = {

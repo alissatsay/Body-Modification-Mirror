@@ -18,7 +18,7 @@ import mediapipe as mp
 
 mp_pose = mp.solutions.pose
 
-import display as Dh
+from helpers import display as Dh
 
 # Same values as run_installation.py's copy (needed here since this module
 # also rotates raw camera frames for these UI screens).
