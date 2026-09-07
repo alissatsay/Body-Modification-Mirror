@@ -12,24 +12,35 @@ prototype in `proof_of_concept/` did start from the clinical mirror's code.
 
 ## Files
 
-- **`run_installation.py`** — the full pipeline: welcome screen, beauty-standard
-  selection, background capture, pose+hand tracking, triangular mesh
-  generation and ARAP deformation, pinch/drag/brush gesture sculpting,
-  finish/brush/drag buttons, and a timed session (3 minutes by default,
-  `SESSION_DURATION_SECONDS`). This is what gets demoed. Determined to be
-  the true final version (of several `fixed_mesh_*` candidates in the old
-  `New_code/` folder) via git history and a function-by-function diff — see
-  "What was consolidated" below.
+- **`run_installation.py`** — now just the entry point: `main()` (the outer
+  restart loop — welcome/home/selection screens, background capture,
+  per-session initialization, then the interaction loop) and
+  `PoseInferenceThread` (the background pose/hand/segmentation inference
+  thread). Everything else that used to live in this 3469-line file has
+  been sorted into `helpers/` below, grouped by what it actually does,
+  with every call site updated to reference the right module. Determined
+  to be the true final version (of several `fixed_mesh_*` candidates in the
+  old `New_code/` folder) via git history and a function-by-function diff —
+  see "What was consolidated" below.
 - **`helpers/`** — the shared building blocks `run_installation.py` is built
   on:
-  - `triangle_mesh.py` — Delaunay triangulation, mesh warping/deformation
-    (including the Gaussian and hip/abdomen deformation helpers), mesh
-    drawing/debug utilities.
+  - `triangle_mesh.py` — Delaunay triangulation, mesh warping/deformation/
+    reconstruction, the render-group layering + yaw-based render-order
+    system, and the segment/render-group name tables and layering config
+    that go with it.
   - `pose_tracking.py` — hand-gesture detection (open palm, peace sign,
-    pinch, with hold-duration trackers for each), segmentation, and
-    pose/body bounding-box helpers.
+    pinch, with hold-duration trackers for each), segmentation, pose/body
+    bounding-box helpers, and the skeleton-frame/binding math the mesh is
+    tracked to (torso frames, mask sampling, body-yaw estimation).
+  - `screens.py` — the welcome, home, beauty-standard-selection and
+    countdown screens, plus the drawing utilities they share (overlay
+    compositing, timeout/countdown text, pinch-hint icons, the animated
+    gradient background) and the beauty-standard state
+    (`current_beauty_standard`) they own.
   - `interaction_loop.py` — the main per-frame interaction loops (brush/drag
-    sculpting, with and without ARAP, rotated and non-rotated variants).
+    sculpting, with and without ARAP, rotated and non-rotated variants),
+    including the skeleton-mesh version's full gesture/button/session-timer
+    logic and its config (brush radius, button geometry, session length).
   - `display.py` — output-frame rotation and fullscreen second-monitor
     window setup.
 - **`assets/`** — image assets `run_installation.py` loads at runtime:
@@ -84,3 +95,47 @@ commit history plus a function-by-function diff:
 was in it has either moved here (with import paths and asset paths updated
 accordingly) or was removed as confirmed-redundant (all removals are
 recoverable from git history; nothing was force-deleted).
+
+## `run_installation.py` → `helpers/` migration
+
+The ~99 top-level functions and 74 module-level constants that used to sit
+directly in `run_installation.py` have been sorted into the four `helpers/`
+modules above (a new `screens.py` was added for the ~20 screen-drawing
+functions, since they didn't fit any existing module). A few things worth
+knowing if you're reading the diff:
+
+- Cross-module calls are qualified (`TMh.`, `PTh.`, `Sc.`, `Lh.`, `Dh.`)
+  exactly like the calls into `helpers/` already were from
+  `run_installation.py` — nothing bare crosses a module boundary except
+  through those aliases.
+- `current_beauty_standard` is real shared mutable state (read and
+  reassigned from both the selection screen and the interaction loop), so
+  `screens.py` is now its sole owner and `interaction_loop.py` reads/writes
+  it as `Sc.current_beauty_standard` rather than keeping its own copy.
+- Path constants derived from `__file__` (`_ASSETS_DIR` and the paths built
+  from it) are recomputed independently in each module that needs them,
+  with an extra `".."` for anything under `helpers/`, rather than passed
+  around — this avoids depending on import order.
+- `OUTPUT_W`/`OUTPUT_H` are still owned by `run_installation.py`, which
+  injects them into `helpers/screens.py` and `helpers/interaction_loop.py`
+  right after importing (`Sc.OUTPUT_W = OUTPUT_W`, etc.).
+- The file previously had its own `rotate_frame()`, a byte-for-byte
+  duplicate of `display.py`'s `rotate_frame_for_output()` but with a
+  *different* default rotation (270°/ccw vs. 90°/ccw). It's been removed;
+  every call site now calls `Dh.rotate_frame_for_output(..., deg=ROTATE_DEG,
+  direction=ROTATE_DIR)` explicitly so the actual demo rotation didn't
+  change.
+- The old entry-point function (a bare call at the bottom of the file, no
+  `if __name__ == "__main__":` guard) has been renamed to `main()` with a
+  proper guard added.
+- While tracing dependencies, found a pre-existing bug: `triangle_mesh.py`'s
+  `compute_render_order_with_arm_override`/`_leg_override` reference
+  `ARM_OVERLAP_TRIGGER_FRAC`/`ARM_FRONT_SCORE_DEADBAND`/
+  `LEG_OVERLAP_TRIGGER_FRAC`/`LEG_FRONT_SCORE_DEADBAND` as globals, but
+  those were only ever assigned as local variables inside the old
+  `run_hand_brush_drag_arap_loop_skeleton` — never at module level. Calling
+  either function would have raised a `NameError` even before this move,
+  any time `SHOW_LAYERED_RENDER` was on. Added them as module constants in
+  `triangle_mesh.py` with the same values (0.020/6.0/0.015/8.0) so the
+  functions are callable; worth double-checking those are the values you
+  actually want.

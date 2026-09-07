@@ -4,6 +4,7 @@ import mediapipe as mp
 import time
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
+from scipy.spatial import Delaunay
 
 import pose_tracking as PTh
 
@@ -1272,3 +1273,770 @@ def arap_deform_2d(
         X[boundary_mask] = boundary_targets[boundary_mask]
 
     return X
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Migrated from run_installation.py (render-group/mesh-geometry tables + mesh helpers)
+# ══════════════════════════════════════════════════════════════════════════════
+
+SEGMENT_NAMES = [
+    "torso",
+    "head",
+    "left_upper_arm",
+    "left_lower_arm",
+    "left_palm",
+    "right_upper_arm",
+    "right_lower_arm",
+    "right_palm",
+    "left_thigh",
+    "left_calf",
+    "right_thigh",
+    "right_calf",
+]
+SEGMENT_INDEX = {name: i for i, name in enumerate(SEGMENT_NAMES)}
+RENDER_GROUP_NAMES = [
+    "torso",
+    "head",
+    "left_arm",
+    "right_arm",
+    "left_leg",
+    "right_leg",
+]
+RENDER_GROUP_INDEX = {name: i for i, name in enumerate(RENDER_GROUP_NAMES)}
+RENDER_GROUP_COLORS = {
+    "torso": (255, 220, 0),
+    "head": (255, 0, 255),
+    "left_arm": (0, 255, 0),
+    "right_arm": (0, 180, 255),
+    "left_leg": (255, 0, 0),
+    "right_leg": (0, 0, 255),
+}
+FIXED_RENDER_ORDER = [
+    "left_leg",
+    "right_leg",
+    "torso",
+    "head",
+    "left_arm",
+    "right_arm",
+]
+USE_SOFT_LAYER_MASKS = False
+USE_FLOAT_ALPHA_COMPOSITING = False
+YAW_ENTER_THRESHOLD = 0.22
+YAW_EXIT_THRESHOLD = 0.12
+YAW_SIGN_SMOOTH_ALPHA = 0.30
+YAW_SIGN_DEADBAND = 0.08
+
+# Pre-existing bug found while moving this code: these 4 were only ever
+# assigned as *local* variables inside run_installation.py's old
+# run_hand_brush_drag_arap_loop_skeleton (now helpers/interaction_loop.py),
+# never at module level, even though compute_render_order_with_arm_override
+# and compute_render_order_with_leg_override below reference them as bare
+# globals — so calling either function would have raised a NameError before
+# this move too, whenever SHOW_LAYERED_RENDER enabled that code path. Adding
+# them here (with the exact values from that dead local assignment) so the
+# functions are actually callable; flagged for Alissa to double-check.
+ARM_OVERLAP_TRIGGER_FRAC = 0.020
+ARM_FRONT_SCORE_DEADBAND = 6.0
+LEG_OVERLAP_TRIGGER_FRAC = 0.015
+LEG_FRONT_SCORE_DEADBAND = 8.0
+
+FRONTAL_RENDER_ORDER = [
+    "left_leg", "right_leg", "torso", "head", "left_arm", "right_arm",
+]
+LEFT_SIDE_FRONT_RENDER_ORDER = [
+    "right_leg", "left_leg", "torso", "head", "right_arm", "left_arm",
+]
+RIGHT_SIDE_FRONT_RENDER_ORDER = [
+    "left_leg", "right_leg", "torso", "head", "left_arm", "right_arm",
+]
+
+def build_adaptive_body_mesh(
+    w, h,
+    body_mask,
+    interior_step=60,
+    contour_step=8,
+    contour_inset=3,
+    min_contour_pts=80,
+):
+    H, W = h, w
+    mask_u8 = (body_mask >= 0.5).astype(np.uint8)
+
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+
+    contour_pts = []
+    if contours:
+        main_contour = max(contours, key=cv2.contourArea)
+        pts_raw = main_contour[:, 0, :].astype(np.float32)
+
+        n_contour = len(pts_raw)
+        step_px = max(1, min(contour_step, n_contour // max(min_contour_pts, 1)))
+        sampled = pts_raw[::step_px]
+
+        if contour_inset > 0 and len(sampled) >= 3:
+            cx = float(np.mean(sampled[:, 0]))
+            cy = float(np.mean(sampled[:, 1]))
+            d = sampled - np.array([cx, cy], dtype=np.float32)
+            norms = np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-6)
+            sampled = sampled - contour_inset * (d / norms)
+            sampled[:, 0] = np.clip(sampled[:, 0], 0, W - 1)
+            sampled[:, 1] = np.clip(sampled[:, 1], 0, H - 1)
+
+        contour_pts = sampled.tolist()
+
+    interior_pts = []
+    for y in range(0, H, interior_step):
+        for x in range(0, W, interior_step):
+            if mask_u8[y, x] > 0:
+                interior_pts.append([float(x), float(y)])
+
+    frame_pts = []
+    for x in range(0, W + 1, interior_step):
+        xc = float(min(x, W - 1))
+        frame_pts.append([xc, 0.0])
+        frame_pts.append([xc, float(H - 1)])
+    for y in range(interior_step, H, interior_step):
+        frame_pts.append([0.0, float(y)])
+        frame_pts.append([float(W - 1), float(y)])
+    frame_pts += [[0.0, 0.0], [float(W-1), 0.0],
+                  [0.0, float(H-1)], [float(W-1), float(H-1)]]
+
+    all_pts = np.array(contour_pts + interior_pts + frame_pts, dtype=np.float32)
+
+    if len(all_pts) < 3:
+        print("build_adaptive_body_mesh: not enough points, falling back to grid")
+        V_fb, T_fb, _, _ = build_grid_mesh(w, h, step=interior_step)
+        active_fb = np.ones(len(T_fb), dtype=bool)
+        return V_fb.astype(np.float32), T_fb, active_fb
+
+    rounded = np.round(all_pts / 2.0).astype(np.int32)
+    _, unique_idx = np.unique(rounded, axis=0, return_index=True)
+    all_pts = all_pts[unique_idx]
+
+    if len(all_pts) < 3:
+        V_fb, T_fb, _, _ = build_grid_mesh(w, h, step=interior_step)
+        active_fb = np.ones(len(T_fb), dtype=bool)
+        return V_fb.astype(np.float32), T_fb, active_fb
+
+    tri = Delaunay(all_pts)
+    T   = tri.simplices.astype(np.int32)
+    V   = all_pts.astype(np.float32)
+
+    centroids = (V[T[:, 0]] + V[T[:, 1]] + V[T[:, 2]]) / 3.0
+    cx = np.clip(np.round(centroids[:, 0]).astype(np.int32), 0, W - 1)
+    cy = np.clip(np.round(centroids[:, 1]).astype(np.int32), 0, H - 1)
+    active = mask_u8[cy, cx] > 0
+
+    print(f"build_adaptive_body_mesh: {len(V)} vertices, {len(T)} triangles, "
+          f"{int(active.sum())} active ({len(contour_pts)} contour pts, "
+          f"{len(interior_pts)} interior pts)")
+
+    return V, T, active
+
+def build_frame_arrays(frames, seg_ids, num_vertices):
+    origins = np.zeros((num_vertices, 2), dtype=np.float32)
+    xhats   = np.zeros((num_vertices, 2), dtype=np.float32)
+    yhats   = np.zeros((num_vertices, 2), dtype=np.float32)
+    lengths = np.zeros(num_vertices,      dtype=np.float32)
+    for i in range(num_vertices):
+        si = seg_ids[i]
+        if si < 0:
+            continue
+        f = frames[SEGMENT_NAMES[si]]
+        origins[i] = f["origin"]
+        xhats[i]   = f["xhat"]
+        yhats[i]   = f["yhat"]
+        lengths[i] = f["length"]
+    return origins, xhats, yhats, lengths
+
+def reconstruct_tracked_mesh_vectorized(binding, frame_arrays):
+    origins, xhats, yhats, lengths = frame_arrays
+    rest_uv = binding["vertex_local_uv_rest"]
+    seg_ids = binding["vertex_segment"]
+    u = rest_uv[:, 0:1]
+    v = rest_uv[:, 1:2]
+    V = origins + u * lengths[:, None] * xhats \
+                + v * lengths[:, None] * yhats
+    V[seg_ids < 0] = 0.0
+    return V.astype(np.float32)
+
+def reconstruct_deformed_mesh_vectorized(binding, frame_arrays):
+    origins, xhats, yhats, lengths = frame_arrays
+    rest_uv = binding["vertex_local_uv_rest"]
+    off_uv  = binding["vertex_local_uv_offset"]
+    seg_ids = binding["vertex_segment"]
+    uv = rest_uv + off_uv
+    u  = uv[:, 0:1]
+    v  = uv[:, 1:2]
+    V = origins + u * lengths[:, None] * xhats \
+                + v * lengths[:, None] * yhats
+    V[seg_ids < 0] = 0.0
+    return V.astype(np.float32)
+
+def update_local_offsets_vectorized(binding, frame_arrays, V_new):
+    origins, xhats, yhats, lengths = frame_arrays
+    seg_ids = binding["vertex_segment"]
+    rest_uv = binding["vertex_local_uv_rest"]
+    valid   = seg_ids >= 0
+    safe_len = np.where(lengths > 1e-6, lengths, 1.0)
+    d = V_new - origins
+    u = np.sum(d * xhats, axis=1) / safe_len
+    v = np.sum(d * yhats, axis=1) / safe_len
+    uv_now = np.stack([u, v], axis=1)
+    binding["vertex_local_uv_offset"][valid] = (uv_now - rest_uv)[valid]
+
+def frames_moved_enough(prev_frames, new_frames, threshold_px=1.5):
+    if prev_frames is None:
+        return True
+    for seg in SEGMENT_NAMES:
+        if seg not in prev_frames or seg not in new_frames:
+            return True
+        if np.linalg.norm(new_frames[seg]["origin"] - prev_frames[seg]["origin"]) > threshold_px:
+            return True
+    return False
+
+def build_active_mesh_mask_fast(h, w, V_def, T, active):
+    return rasterize_triangle_mask_from_indices(h, w, V_def, T, np.flatnonzero(active).astype(np.int32))
+
+def composite_mesh_with_background_holefill(frame_raw, bg_plate, warped_mesh_bgr,
+                                             mesh_mask_u8, seg_mask, body_thresh=0.50,
+                                             dilate_ksize=7, blur_ksize=5, apply_mesh=True):
+    out = frame_raw.copy()
+    body_mask = (seg_mask >= body_thresh).astype(np.uint8) * 255
+    if dilate_ksize is not None and dilate_ksize > 1:
+        k = int(dilate_ksize); k = k if k % 2 == 1 else k + 1
+        body_mask = cv2.dilate(body_mask, np.ones((k, k), np.uint8), iterations=1)
+    hole_mask = cv2.bitwise_and(body_mask, cv2.bitwise_not(mesh_mask_u8))
+    if blur_ksize is not None and blur_ksize > 1:
+        k = int(blur_ksize); k = k if k % 2 == 1 else k + 1
+        hole_mask = cv2.GaussianBlur(hole_mask, (k, k), 0)
+    if hole_mask.ndim == 2:
+        out = alpha_composite_bgr(out, bg_plate, hole_mask.astype(np.float32) / 255.0)
+    if apply_mesh:
+        out = composite_bgr_hard_mask(out, warped_mesh_bgr, mesh_mask_u8)
+    return out, hole_mask
+
+def override_arm_order(base_order, left_arm_front=None, right_arm_front=None):
+    leg_block = [x for x in base_order if x in ("left_leg", "right_leg")]
+    arm_block  = [x for x in base_order if x in ("left_arm", "right_arm")]
+    back_arms, front_arms = [], []
+    for arm_name in arm_block:
+        flag = left_arm_front if arm_name == "left_arm" else right_arm_front
+        (back_arms if flag is False else front_arms).append(arm_name)
+    return leg_block + back_arms + ["torso", "head"] + front_arms
+
+def compute_render_order_with_arm_override(base_order, layers, stable_pts, yaw_state_txt):
+    if layers is None:
+        return base_order, 0.0, 0.0, 0.0, 0.0, False
+    torso_mask     = layers["torso"]["mask_u8"]
+    left_arm_mask  = layers["left_arm"]["mask_u8"]
+    right_arm_mask = layers["right_arm"]["mask_u8"]
+    left_ov  = compute_mask_overlap_fraction(left_arm_mask, torso_mask)
+    right_ov = compute_mask_overlap_fraction(right_arm_mask, torso_mask)
+    ls, rs, lf, rf, used = 0.0, 0.0, None, None, False
+    if left_ov >= ARM_OVERLAP_TRIGGER_FRAC:
+        ls = PTh.compute_arm_front_score(stable_pts, "left_arm", yaw_state_txt); used = True
+        if ls > ARM_FRONT_SCORE_DEADBAND: lf = True
+        elif ls < -ARM_FRONT_SCORE_DEADBAND: lf = False
+    if right_ov >= ARM_OVERLAP_TRIGGER_FRAC:
+        rs = PTh.compute_arm_front_score(stable_pts, "right_arm", yaw_state_txt); used = True
+        if rs > ARM_FRONT_SCORE_DEADBAND: rf = True
+        elif rs < -ARM_FRONT_SCORE_DEADBAND: rf = False
+    return override_arm_order(base_order, lf, rf), left_ov, right_ov, ls, rs, used
+
+def composite_prebuilt_layers(base_bgr, layers, render_order):
+    out = base_bgr.copy()
+    for group_name in render_order:
+        layer = layers[group_name]
+        if USE_FLOAT_ALPHA_COMPOSITING:
+            out = alpha_composite_bgr(out, layer["color"],
+                                      layer["mask_u8"].astype(np.float32) / 255.0)
+        else:
+            out = composite_bgr_hard_mask(out, layer["color"], layer["mask_u8"])
+    return out
+
+def compute_mask_overlap_fraction(mask_a_u8, mask_b_u8):
+    a = mask_a_u8 > 0; b = mask_b_u8 > 0
+    area_a = int(np.count_nonzero(a)); area_b = int(np.count_nonzero(b))
+    if area_a == 0 or area_b == 0:
+        return 0.0
+    return int(np.count_nonzero(a & b)) / float(max(1, min(area_a, area_b)))
+
+def override_leg_order(base_order, left_leg_front):
+    order = [x for x in base_order if x not in ("left_leg", "right_leg")]
+    return (["right_leg", "left_leg"] if left_leg_front else ["left_leg", "right_leg"]) + order
+
+def compute_render_order_with_leg_override(base_order, layers, stable_pts, yaw_state_txt):
+    if layers is None:
+        return base_order, 0.0, 0.0, False
+    ov = compute_mask_overlap_fraction(layers["left_leg"]["mask_u8"], layers["right_leg"]["mask_u8"])
+    if ov < LEG_OVERLAP_TRIGGER_FRAC:
+        return base_order, ov, 0.0, False
+    score = PTh.compute_leg_front_score(stable_pts, yaw_state_txt)
+    if score > LEG_FRONT_SCORE_DEADBAND:
+        return override_leg_order(base_order, True),  ov, score, True
+    elif score < -LEG_FRONT_SCORE_DEADBAND:
+        return override_leg_order(base_order, False), ov, score, True
+    return base_order, ov, score, True
+
+def compute_render_order_from_yaw(cur_pts, ref_metrics, interaction_state):
+    yaw_amount, _, yaw_debug = PTh.estimate_body_yaw(cur_pts, ref_metrics)
+    prev_s = float(interaction_state.get("yaw_sign_value_smooth", 0.0))
+    sign_value_smooth = (1.0 - YAW_SIGN_SMOOTH_ALPHA) * prev_s + \
+                         YAW_SIGN_SMOOTH_ALPHA * float(yaw_debug["sign_value"])
+    interaction_state["yaw_sign_value_smooth"] = float(sign_value_smooth)
+    if sign_value_smooth > YAW_SIGN_DEADBAND: yaw_sign = 1.0
+    elif sign_value_smooth < -YAW_SIGN_DEADBAND: yaw_sign = -1.0
+    else: yaw_sign = 0.0
+    prev_state = interaction_state.get("yaw_side_state", "frontal")
+    state = prev_state
+    if prev_state == "frontal":
+        if yaw_amount >= YAW_ENTER_THRESHOLD:
+            state = "left_front" if yaw_sign > 0 else ("right_front" if yaw_sign < 0 else "frontal")
+    elif prev_state == "left_front":
+        if yaw_amount <= YAW_EXIT_THRESHOLD: state = "frontal"
+        elif yaw_sign < 0 and yaw_amount >= YAW_ENTER_THRESHOLD: state = "right_front"
+    elif prev_state == "right_front":
+        if yaw_amount <= YAW_EXIT_THRESHOLD: state = "frontal"
+        elif yaw_sign > 0 and yaw_amount >= YAW_ENTER_THRESHOLD: state = "left_front"
+    interaction_state["yaw_side_state"] = state
+    if state == "left_front":    render_order = LEFT_SIDE_FRONT_RENDER_ORDER;  yaw_state_txt = "left side front"
+    elif state == "right_front": render_order = RIGHT_SIDE_FRONT_RENDER_ORDER; yaw_state_txt = "right side front"
+    else:                        render_order = FRONTAL_RENDER_ORDER;           yaw_state_txt = "frontal"
+    yaw_debug["sign_value_smooth"] = float(sign_value_smooth)
+    return render_order, yaw_amount, yaw_sign, yaw_state_txt, yaw_debug
+
+def build_render_group_triangle_index_cache(binding):
+    tri_active = binding["tri_active"]; tri_render_group = binding["tri_render_group"]
+    return {name: np.flatnonzero(tri_active & (tri_render_group == RENDER_GROUP_INDEX[name])).astype(np.int32)
+            for name in RENDER_GROUP_NAMES}
+
+def rasterize_triangle_mask_from_indices(h, w, V_dst, T, tri_indices):
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if tri_indices is None or len(tri_indices) == 0:
+        return mask
+    for k in tri_indices:
+        tri = V_dst[T[k]].astype(np.float32)
+        if not np.isfinite(tri).all(): continue
+        if triangle_area2(tri) < 1.0: continue
+        if not _triangle_inside_image(tri, w, h): continue
+        cv2.fillConvexPoly(mask, np.round(tri).astype(np.int32), 255, lineType=cv2.LINE_AA)
+    return mask
+
+def warp_mesh_piecewise_to_blank_indices(src_img, V_src, V_dst, T, tri_indices,
+                                          min_area=1.0, min_bbox=2.0):
+    h, w = src_img.shape[:2]
+    dst_img = np.zeros_like(src_img)
+    if tri_indices is None or len(tri_indices) == 0:
+        return dst_img
+    for k in tri_indices:
+        tri_idx = T[k]
+        t_src = V_src[tri_idx].astype(np.float32)
+        t_dst = V_dst[tri_idx].astype(np.float32)
+        if not np.isfinite(t_src).all() or not np.isfinite(t_dst).all(): continue
+        if triangle_area2(t_src) < min_area or triangle_area2(t_dst) < min_area: continue
+        src_bw, src_bh = _triangle_bbox_size(t_src)
+        dst_bw, dst_bh = _triangle_bbox_size(t_dst)
+        if src_bw < min_bbox or src_bh < min_bbox or dst_bw < min_bbox or dst_bh < min_bbox: continue
+        if not _triangle_inside_image(t_src, w, h): continue
+        try:
+            warp_triangle(src_img, dst_img, t_src, t_dst)
+        except cv2.error:
+            continue
+    return dst_img
+
+def render_group_layer_fast(src_img, V_src, V_dst, T, tri_indices,
+                             min_area=4.0, min_bbox=3.0,
+                             mask_dilate_ksize=0, mask_blur_ksize=0):
+    h, w = src_img.shape[:2]
+    if tri_indices is None or len(tri_indices) == 0:
+        return np.zeros_like(src_img), np.zeros((h, w), dtype=np.uint8)
+    layer_color = warp_mesh_piecewise_to_blank_indices(src_img, V_src, V_dst, T, tri_indices, min_area, min_bbox)
+    layer_mask_u8 = rasterize_triangle_mask_from_indices(h, w, V_dst, T, tri_indices)
+    if USE_SOFT_LAYER_MASKS:
+        layer_mask_u8 = soften_layer_mask(layer_mask_u8, mask_dilate_ksize, mask_blur_ksize)
+    return layer_color, layer_mask_u8
+
+def composite_bgr_hard_mask(base_bgr, over_bgr, mask_u8):
+    out = base_bgr.copy(); out[mask_u8 > 0] = over_bgr[mask_u8 > 0]; return out
+
+def build_layered_body_layers_fast(frame_raw, V_track, V_def, T, binding,
+                                    min_area=4.0, min_bbox=3.0,
+                                    mask_dilate_ksize=0, mask_blur_ksize=0):
+    layers = {}
+    group_tri_indices = binding.get("group_tri_indices") or build_render_group_triangle_index_cache(binding)
+    binding["group_tri_indices"] = group_tri_indices
+    for group_name in RENDER_GROUP_NAMES:
+        color, mask_u8 = render_group_layer_fast(frame_raw, V_track, V_def, T,
+                                                  group_tri_indices[group_name],
+                                                  min_area, min_bbox,
+                                                  mask_dilate_ksize, mask_blur_ksize)
+        layers[group_name] = {"color": color, "mask_u8": mask_u8}
+    return layers
+
+def render_layered_body_fixed_order_fast(frame_raw, V_track, V_def, T, binding,
+                                          render_order=None, min_area=4.0, min_bbox=3.0,
+                                          mask_dilate_ksize=0, mask_blur_ksize=0):
+    if render_order is None: render_order = FIXED_RENDER_ORDER
+    layers = build_layered_body_layers_fast(frame_raw, V_track, V_def, T, binding,
+                                             min_area, min_bbox, mask_dilate_ksize, mask_blur_ksize)
+    return composite_prebuilt_layers(frame_raw, layers, render_order), layers
+
+def get_tri_mask_for_render_group(binding, group_name):
+    gid = RENDER_GROUP_INDEX[group_name]
+    return binding["tri_active"] & (binding["tri_render_group"] == gid)
+
+def rasterize_triangle_mask(h, w, V_dst, T, tri_mask):
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for k, tri_idx in enumerate(T):
+        if not tri_mask[k]: continue
+        tri = V_dst[tri_idx].astype(np.float32)
+        if not np.isfinite(tri).all(): continue
+        if triangle_area2(tri) < 1.0: continue
+        if not _triangle_inside_image(tri, w, h): continue
+        cv2.fillConvexPoly(mask, np.round(tri).astype(np.int32), 255, lineType=cv2.LINE_AA)
+    return mask
+
+def soften_layer_mask(mask_u8, dilate_ksize=5, blur_ksize=5):
+    out = mask_u8.copy()
+    if dilate_ksize is not None and dilate_ksize > 1:
+        k = int(dilate_ksize); k = k if k % 2 == 1 else k + 1
+        out = cv2.dilate(out, np.ones((k, k), np.uint8), iterations=1)
+    if blur_ksize is not None and blur_ksize > 1:
+        k = int(blur_ksize); k = k if k % 2 == 1 else k + 1
+        out = cv2.GaussianBlur(out, (k, k), 0)
+    return out
+
+def warp_mesh_piecewise_to_blank(src_img, V_src, V_dst, T, active_mask=None,
+                                  min_area=1.0, min_bbox=2.0):
+    h, w = src_img.shape[:2]
+    dst_img = np.zeros_like(src_img)
+    if active_mask is None: active_mask = np.ones(len(T), dtype=bool)
+    for k, tri_idx in enumerate(T):
+        if not active_mask[k]: continue
+        t_src = V_src[tri_idx].astype(np.float32); t_dst = V_dst[tri_idx].astype(np.float32)
+        if not np.isfinite(t_src).all() or not np.isfinite(t_dst).all(): continue
+        if triangle_area2(t_src) < min_area or triangle_area2(t_dst) < min_area: continue
+        src_bw, src_bh = _triangle_bbox_size(t_src); dst_bw, dst_bh = _triangle_bbox_size(t_dst)
+        if src_bw < min_bbox or src_bh < min_bbox or dst_bw < min_bbox or dst_bh < min_bbox: continue
+        if not _triangle_inside_image(t_src, w, h): continue
+        try: warp_triangle(src_img, dst_img, t_src, t_dst)
+        except cv2.error: continue
+    return dst_img
+
+def render_group_layer(src_img, V_src, V_dst, T, tri_mask,
+                       min_area=4.0, min_bbox=3.0,
+                       mask_dilate_ksize=5, mask_blur_ksize=5):
+    h, w = src_img.shape[:2]
+    if tri_mask is None or not np.any(tri_mask):
+        return np.zeros_like(src_img), np.zeros((h, w), dtype=np.float32)
+    layer_color = warp_mesh_piecewise_to_blank(src_img, V_src, V_dst, T, tri_mask, min_area, min_bbox)
+    layer_mask_u8 = soften_layer_mask(rasterize_triangle_mask(h, w, V_dst, T, tri_mask),
+                                       mask_dilate_ksize, mask_blur_ksize)
+    return layer_color, layer_mask_u8.astype(np.float32) / 255.0
+
+def alpha_composite_bgr(base_bgr, over_bgr, alpha):
+    alpha3 = alpha[:, :, None] if alpha.ndim == 2 else alpha
+    return np.clip(alpha3 * over_bgr.astype(np.float32) +
+                   (1.0 - alpha3) * base_bgr.astype(np.float32), 0, 255).astype(np.uint8)
+
+def render_layered_body_fixed_order(frame_raw, V_track, V_def, T, binding,
+                                     render_order=None, min_area=4.0, min_bbox=3.0,
+                                     mask_dilate_ksize=5, mask_blur_ksize=5):
+    if render_order is None: render_order = FIXED_RENDER_ORDER
+    out = frame_raw.copy(); layers = {}
+    for group_name in RENDER_GROUP_NAMES:
+        tri_mask = get_tri_mask_for_render_group(binding, group_name)
+        color, alpha = render_group_layer(frame_raw, V_track, V_def, T, tri_mask,
+                                          min_area, min_bbox, mask_dilate_ksize, mask_blur_ksize)
+        layers[group_name] = {"color": color, "alpha": alpha}
+    for group_name in render_order:
+        out = alpha_composite_bgr(out, layers[group_name]["color"], layers[group_name]["alpha"])
+    return out, layers
+
+def fine_segment_to_render_group(seg_idx):
+    if seg_idx is None or seg_idx < 0 or seg_idx >= len(SEGMENT_NAMES): return -1
+    seg_name = SEGMENT_NAMES[int(seg_idx)]
+    if seg_name == "torso": return RENDER_GROUP_INDEX["torso"]
+    if seg_name == "head":  return RENDER_GROUP_INDEX["head"]
+    if seg_name in ("left_upper_arm",  "left_lower_arm",  "left_palm"):  return RENDER_GROUP_INDEX["left_arm"]
+    if seg_name in ("right_upper_arm", "right_lower_arm", "right_palm"): return RENDER_GROUP_INDEX["right_arm"]
+    if seg_name in ("left_thigh",  "left_calf"):  return RENDER_GROUP_INDEX["left_leg"]
+    if seg_name in ("right_thigh", "right_calf"): return RENDER_GROUP_INDEX["right_leg"]
+    return -1
+
+def build_triangle_render_groups(binding, T):
+    vertex_segment = binding["vertex_segment"]; tri_active = binding["tri_active"]
+    tri_render_group = -np.ones(len(T), dtype=np.int32)
+    for k, tri in enumerate(T):
+        if not tri_active[k]: continue
+        fine_ids = vertex_segment[tri]
+        if np.any(fine_ids < 0): continue
+        coarse_ids = [fine_segment_to_render_group(int(s)) for s in fine_ids]
+        if np.any(np.array(coarse_ids) < 0): continue
+        vals, counts = np.unique(np.array(coarse_ids, dtype=np.int32), return_counts=True)
+        tri_render_group[k] = int(vals[np.argmax(counts)])
+    return tri_render_group
+
+def draw_triangle_render_group_overlay(frame, V, T, tri_active, tri_render_group,
+                                        alpha=0.28, line_thickness=1):
+    out = frame.copy(); overlay = frame.copy()
+    for k, tri_idx in enumerate(T):
+        if not tri_active[k]: continue
+        group_id = int(tri_render_group[k])
+        if group_id < 0 or group_id >= len(RENDER_GROUP_NAMES): continue
+        color = RENDER_GROUP_COLORS[RENDER_GROUP_NAMES[group_id]]
+        tri = np.round(V[tri_idx]).astype(np.int32)
+        cv2.fillConvexPoly(overlay, tri, color, lineType=cv2.LINE_AA)
+        cv2.polylines(overlay, [tri.reshape(-1, 1, 2)], True, color, line_thickness, cv2.LINE_AA)
+    return cv2.addWeighted(overlay, float(alpha), out, 1.0 - float(alpha), 0.0)
+
+def draw_filled_triangle_highlight(frame, V, T, tri_mask,
+                                    fill_color=(0,255,0), fill_alpha=0.16,
+                                    edge_color=(0,255,0), edge_thickness=2, edge_alpha=0.95):
+    out = frame.copy()
+    if tri_mask is None or not np.any(tri_mask): return out
+    tri_ids = np.flatnonzero(tri_mask)
+    fill_overlay = np.zeros_like(frame)
+    for k in tri_ids:
+        cv2.fillConvexPoly(fill_overlay, np.round(V[T[k]]).astype(np.int32), fill_color, cv2.LINE_AA)
+    out = cv2.addWeighted(fill_overlay, float(fill_alpha), out, 1.0, 0.0)
+    edge_overlay = np.zeros_like(frame)
+    for k in tri_ids:
+        cv2.polylines(edge_overlay, [np.round(V[T[k]]).astype(np.int32).reshape(-1,1,2)],
+                      True, edge_color, edge_thickness, cv2.LINE_AA)
+    out = cv2.addWeighted(edge_overlay, float(edge_alpha), out, 1.0, 0.0)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+def print_render_group_triangle_stats(binding):
+    tri_active = binding["tri_active"]; tri_render_group = binding["tri_render_group"]
+    print("\n--- Triangle render-group stats ---")
+    print(f"active triangles total: {int(np.sum(tri_active))}/{len(tri_active)}")
+    for group_name in RENDER_GROUP_NAMES:
+        gid = RENDER_GROUP_INDEX[group_name]
+        print(f"{group_name:>10s}: {int(np.sum(tri_active & (tri_render_group == gid)))}")
+    print(f"{'unassigned':>10s}: {int(np.sum(tri_active & (tri_render_group < 0)))}")
+    print("-----------------------------------\n")
+
+def triangle_area2(tri):
+    a, b, c = tri
+    return abs((b[0]-a[0])*(c[1]-a[1]) - (b[1]-a[1])*(c[0]-a[0]))
+
+def _triangle_bbox_size(tri):
+    return float(np.max(tri[:,0])-np.min(tri[:,0])), float(np.max(tri[:,1])-np.min(tri[:,1]))
+
+def _triangle_inside_image(tri, w, h, pad=2.0):
+    x0=np.min(tri[:,0]); x1=np.max(tri[:,0]); y0=np.min(tri[:,1]); y1=np.max(tri[:,1])
+    return not (x1 < -pad or y1 < -pad or x0 > w-1+pad or y0 > h-1+pad)
+
+def warp_mesh_piecewise(src_img, V_src, V_dst, T, active_mask=None, dst_img=None,
+                         min_area=1.0, min_bbox=2.0):
+    if dst_img is None: dst_img = src_img.copy()
+    if active_mask is None: active_mask = np.ones(len(T), dtype=bool)
+    h, w = src_img.shape[:2]
+    for k, tri_idx in enumerate(T):
+        if not active_mask[k]: continue
+        t_src = V_src[tri_idx].astype(np.float32); t_dst = V_dst[tri_idx].astype(np.float32)
+        if not np.isfinite(t_src).all() or not np.isfinite(t_dst).all(): continue
+        if triangle_area2(t_src) < min_area or triangle_area2(t_dst) < min_area: continue
+        src_bw, src_bh = _triangle_bbox_size(t_src); dst_bw, dst_bh = _triangle_bbox_size(t_dst)
+        if src_bw < min_bbox or src_bh < min_bbox or dst_bw < min_bbox or dst_bh < min_bbox: continue
+        if not _triangle_inside_image(t_src, w, h): continue
+        try: warp_triangle(src_img, dst_img, t_src, t_dst)
+        except cv2.error: continue
+    return dst_img
+
+def reconstruct_tracked_mesh_from_skeleton(binding, cur_pts, V_base):
+    frames = PTh.build_segment_frames(cur_pts)
+    if frames is None: return None, None
+    V_track = V_base.copy().astype(np.float32)
+    seg_ids = binding["vertex_segment"]; rest_uv = binding["vertex_local_uv_rest"]
+    for i in range(len(V_track)):
+        si = seg_ids[i]
+        if si < 0: continue
+        V_track[i] = PTh.world_from_local_in_frame(rest_uv[i], frames[SEGMENT_NAMES[si]])
+    return V_track, frames
+
+def reconstruct_deformed_mesh_from_skeleton(binding, cur_pts, V_base):
+    frames = PTh.build_segment_frames(cur_pts)
+    if frames is None: return None, None
+    V_def = V_base.copy().astype(np.float32)
+    seg_ids = binding["vertex_segment"]
+    rest_uv = binding["vertex_local_uv_rest"]; off_uv = binding["vertex_local_uv_offset"]
+    for i in range(len(V_def)):
+        si = seg_ids[i]
+        if si < 0: continue
+        V_def[i] = PTh.world_from_local_in_frame(rest_uv[i] + off_uv[i], frames[SEGMENT_NAMES[si]])
+    return V_def, frames
+
+def triangle_centroids(V, T):
+    return (V[T[:,0]] + V[T[:,1]] + V[T[:,2]]) / 3.0
+
+def build_vertex_neighbors_from_triangles(num_vertices, T):
+    neighbors = [set() for _ in range(num_vertices)]
+    for tri in T:
+        a, b, c = map(int, tri)
+        neighbors[a].update((b,c)); neighbors[b].update((a,c)); neighbors[c].update((a,b))
+    return neighbors
+
+def extract_largest_mask_contour(mask, thresh=0.5):
+    m = (mask >= thresh).astype(np.uint8)
+    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours: return None
+    contour = max(contours, key=cv2.contourArea)
+    return None if (contour is None or len(contour) < 3) else contour[:,0,:].astype(np.float32)
+
+def shape_mesh_boundary_to_mask(V_base, T, init_mask, mask_thresh=0.5, snap_dist_px=24.0, smooth_iters=1):
+    if init_mask is None: return V_base.copy().astype(np.float32)
+    V_new = V_base.copy().astype(np.float32)
+    inside = PTh.sample_mask_at_points(init_mask, V_base, thresh=mask_thresh)
+    if not np.any(inside): return V_new
+    contour_pts = extract_largest_mask_contour(init_mask, thresh=mask_thresh)
+    if contour_pts is None or len(contour_pts) == 0: return V_new
+    neighbors = build_vertex_neighbors_from_triangles(len(V_base), T)
+    boundary = np.zeros(len(V_base), dtype=bool)
+    for i in range(len(V_base)):
+        if not inside[i]: continue
+        for j in neighbors[i]:
+            if not inside[j]: boundary[i] = True; break
+    boundary_ids = np.flatnonzero(boundary)
+    if len(boundary_ids) == 0: return V_new
+    snap_dist2 = float(max(snap_dist_px, 1.0)) ** 2
+    for i in boundary_ids:
+        d2 = np.sum((contour_pts - V_new[i][None,:])**2, axis=1)
+        j = int(np.argmin(d2))
+        if d2[j] <= snap_dist2: V_new[i] = contour_pts[j]
+    for _ in range(max(0, int(smooth_iters))):
+        prev = V_new.copy()
+        for i in boundary_ids:
+            nbrs = [j for j in neighbors[i] if inside[j]]
+            if nbrs: V_new[i] = 0.7*prev[i] + 0.3*np.mean(prev[nbrs], axis=0)
+    return V_new.astype(np.float32)
+
+def bind_mesh_to_skeleton(V_base, T, ref_pts, init_seg_mask, mask_thresh=0.5):
+    ref_frames = PTh.build_segment_frames(ref_pts)
+    if ref_frames is None or init_seg_mask is None: return None
+    init_mask = PTh.expand_mask(init_seg_mask, ksize=9)
+    vertex_in_mask = PTh.sample_mask_at_points(init_mask, V_base, thresh=mask_thresh)
+    vertex_segment = -np.ones(len(V_base), dtype=np.int32)
+    vertex_local_uv = np.zeros((len(V_base), 2), dtype=np.float32)
+
+    shoulder_mid = 0.5*(ref_pts["left_shoulder"]+ref_pts["right_shoulder"])
+    hip_mid      = 0.5*(ref_pts["left_hip"]+ref_pts["right_hip"])
+    shoulder_w   = np.linalg.norm(ref_pts["right_shoulder"]-ref_pts["left_shoulder"])
+    shoulder_y   = min(ref_pts["left_shoulder"][1], ref_pts["right_shoulder"][1])
+    hip_y        = max(ref_pts["left_hip"][1],      ref_pts["right_hip"][1])
+    torso_quad   = PTh.torso_quad_from_pts(ref_pts, expand_x=0.28, expand_y_top=0.22, expand_y_bottom=0.12)
+
+    head_center = (ref_pts["nose"] + np.array([0.0,-0.18*shoulder_w],dtype=np.float32)
+                   if ref_pts.get("nose") is not None
+                   else shoulder_mid + np.array([0.0,-0.75*shoulder_w],dtype=np.float32))
+    head_radius  = max(36.0, 0.70*shoulder_w)
+    torso_left   = min(ref_pts["left_shoulder"][0],  ref_pts["left_hip"][0])  - 0.22*shoulder_w
+    torso_right  = max(ref_pts["right_shoulder"][0], ref_pts["right_hip"][0]) + 0.22*shoulder_w
+    left_shoulder  = ref_pts.get("left_shoulder")
+    right_shoulder = ref_pts.get("right_shoulder")
+    shoulder_cap_r = max(24.0, 0.30*shoulder_w)
+
+    arm_capsules = []
+    for s_key, e_key, w_key, ua, la, pa, ud, ld in [
+        ("left_shoulder",  "left_elbow",  "left_wrist",
+         "left_upper_arm",  "left_lower_arm",  "left_palm",  0.26, 0.22),
+        ("right_shoulder", "right_elbow", "right_wrist",
+         "right_upper_arm", "right_lower_arm", "right_palm", 0.26, 0.22),
+    ]:
+        s=ref_pts.get(s_key); e=ref_pts.get(e_key); w=ref_pts.get(w_key)
+        if s is not None and e is not None: arm_capsules.append((ua, s, e, ud))
+        if e is not None and w is not None:
+            arm_capsules.append((la, e, w, ld))
+            lw_dir = w - e; lw_len = np.linalg.norm(lw_dir)
+            if lw_len > 1e-6:
+                arm_capsules.append((pa, w, w + (lw_dir/lw_len)*0.75*lw_len, 0.42))
+
+    leg_capsules = []
+    for h_key, k_key, a_key, th, ca, thrad, carad in [
+        ("left_hip",  "left_knee",  "left_ankle",  "left_thigh",  "left_calf",  0.28, 0.24),
+        ("right_hip", "right_knee", "right_ankle", "right_thigh", "right_calf", 0.28, 0.24),
+    ]:
+        h=ref_pts.get(h_key); k=ref_pts.get(k_key); a=ref_pts.get(a_key)
+        if h is not None and k is not None: leg_capsules.append((th, h, k, thrad))
+        if k is not None and a is not None: leg_capsules.append((ca, k, a, carad))
+
+    def assign_vertex(i, seg):
+        vertex_segment[i] = SEGMENT_INDEX[seg]
+        vertex_local_uv[i] = PTh.localize_point_in_frame(V_base[i], ref_frames[seg])
+
+    def best_capsule_match(p, capsule_defs, min_radius_px, accept_scale,
+                            allowed_sides=None, y_min=None, y_max=None):
+        best_seg, best_dist = None, np.inf
+        for seg, a, b, radius_scale in capsule_defs:
+            seg_len = np.linalg.norm(b - a)
+            radius  = max(min_radius_px, radius_scale * seg_len)
+            if allowed_sides is not None:
+                if "left"  in seg and "left"  not in allowed_sides: continue
+                if "right" in seg and "right" not in allowed_sides: continue
+            if y_min is not None and p[1] < y_min: continue
+            if y_max is not None and p[1] > y_max: continue
+            dist, _, _ = PTh.point_segment_distance(p, a, b)
+            if dist <= accept_scale * radius and dist < best_dist:
+                best_dist, best_seg = dist, seg
+        return best_seg
+
+    arm_y_max = hip_y + 0.10 * shoulder_w
+    leg_y_min = shoulder_y + 0.35 * shoulder_w
+
+    for i, p in enumerate(V_base):
+        if not vertex_in_mask[i]: continue
+        assigned = False
+        if PTh.point_in_quad(p, torso_quad):
+            assign_vertex(i, "torso"); assigned = True
+        if not assigned:
+            in_l = left_shoulder  is not None and np.linalg.norm(p-left_shoulder)  <= shoulder_cap_r
+            in_r = right_shoulder is not None and np.linalg.norm(p-right_shoulder) <= shoulder_cap_r
+            if in_l and not in_r:   assign_vertex(i,"left_upper_arm");  assigned=True
+            elif in_r and not in_l: assign_vertex(i,"right_upper_arm"); assigned=True
+            elif in_l and in_r:
+                assign_vertex(i, "left_upper_arm" if np.linalg.norm(p-left_shoulder) <= np.linalg.norm(p-right_shoulder) else "right_upper_arm")
+                assigned=True
+        if not assigned and np.linalg.norm(p-head_center) <= head_radius:
+            assign_vertex(i,"head"); assigned=True
+        if not assigned:
+            neck_top=shoulder_y-0.24*shoulder_w; neck_bot=shoulder_y+0.22*shoulder_w
+            if neck_top<=p[1]<=neck_bot and torso_left<=p[0]<=torso_right:
+                assign_vertex(i,"torso"); assigned=True
+        if not assigned and leg_capsules:
+            seg=best_capsule_match(p, leg_capsules, 12.0, 1.15, y_min=leg_y_min)
+            if seg: assign_vertex(i,seg); assigned=True
+        if not assigned and arm_capsules:
+            palm_caps=[c for c in arm_capsules if c[0].endswith("palm")]
+            if palm_caps:
+                seg=best_capsule_match(p, palm_caps, 18.0, 1.60, y_max=arm_y_max+0.35*shoulder_w)
+                if seg: assign_vertex(i,seg); assigned=True
+        if not assigned and arm_capsules:
+            non_palm=[c for c in arm_capsules if not c[0].endswith("palm")]
+            if non_palm:
+                seg=best_capsule_match(p, non_palm, 10.0, 1.25, y_max=arm_y_max+0.15*shoulder_w)
+                if seg: assign_vertex(i,seg); assigned=True
+
+    tri_vertices_in_mask = np.all(vertex_in_mask[T], axis=1)
+    tri_centroid_in_mask = PTh.sample_mask_at_points(init_mask, triangle_centroids(V_base, T), thresh=mask_thresh)
+    tri_assigned = np.all(vertex_segment[T] >= 0, axis=1)
+    tri_active   = tri_vertices_in_mask & tri_centroid_in_mask & tri_assigned
+    used_vertices = np.zeros(len(V_base), dtype=bool)
+    if np.any(tri_active):
+        used_vertices[np.unique(T[tri_active].reshape(-1))] = True
+    vertex_segment[~used_vertices] = -1
+    return {
+        "ref_pts": ref_pts, "ref_frames": ref_frames,
+        "vertex_segment": vertex_segment,
+        "vertex_local_uv_rest": vertex_local_uv.copy(),
+        "vertex_local_uv_offset": np.zeros_like(vertex_local_uv),
+        "tri_active": tri_active, "vertex_in_mask": vertex_in_mask,
+    }
+
+def update_local_offsets_from_world(binding, frames, V_new):
+    seg_ids=binding["vertex_segment"]; rest_uv=binding["vertex_local_uv_rest"]; off_uv=binding["vertex_local_uv_offset"]
+    for i in range(len(V_new)):
+        si=seg_ids[i]
+        if si<0: continue
+        off_uv[i] = PTh.localize_point_in_frame(V_new[i], frames[SEGMENT_NAMES[si]]) - rest_uv[i]
+
