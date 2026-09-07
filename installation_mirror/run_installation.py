@@ -2,10 +2,7 @@ import os
 import cv2
 import numpy as np
 import mediapipe as mp
-import time
 import threading
-import random
-from scipy.spatial import Delaunay
 
 mp_pose = mp.solutions.pose
 
