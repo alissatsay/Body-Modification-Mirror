@@ -7,6 +7,11 @@ pose tracking + person/background segmentation) but serve different
 purposes, audiences, and papers — they're kept in separate folders on
 purpose, and neither depends on the other.
 
+Both grew out of the same senior thesis project — see
+[`Alissa_Tsay_Thesis_Paper.pdf`](Alissa_Tsay_Thesis_Paper.pdf) and
+[`Alissa_Tsay_Poster.pdf`](Alissa_Tsay_Poster.pdf) for the full writeup and
+the presentation poster.
+
 ## [`clinical_mirror/`](clinical_mirror/) — the clinical mirror
 
 A Gaussian pixel-warp mirror (stretches/compresses a region of the body
@@ -50,9 +55,11 @@ background, then start the mirror. Press `q` to quit either one.
 ## Repo layout
 
 ```
-clinical_mirror/        the clinical warp mirror (HSRC study, CHI paper)
-installation_mirror/    the Reshape Repeat mesh-sculpting installation
-requirements.txt        shared Python dependencies for both projects
+clinical_mirror/               the clinical warp mirror (HSRC study, CHI paper)
+installation_mirror/           the Reshape Repeat mesh-sculpting installation
+requirements.txt               shared Python dependencies for both projects
+Alissa_Tsay_Thesis_Paper.pdf   the senior thesis writeup covering both mirrors
+Alissa_Tsay_Poster.pdf         the thesis presentation poster
 ```
 
 Generated data folders (`images_for_warping/`, `warped_dataset*`,
