@@ -58,7 +58,7 @@ background, then start the mirror. Press `q` to quit either one.
 clinical_mirror/               the clinical warp mirror (HSRC study, CHI paper)
 installation_mirror/           the Reshape Repeat mesh-sculpting installation
 requirements.txt               shared Python dependencies for both projects
-Alissa_Tsay_Thesis_Paper.pdf   the senior thesis writeup covering both mirrors
+Alissa_Tsay_Thesis_Paper.pdf   the senior thesis writeup covering the clinical mirror
 Alissa_Tsay_Poster.pdf         the thesis presentation poster
 ```
 
