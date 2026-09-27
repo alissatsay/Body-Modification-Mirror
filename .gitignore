@@ -24,3 +24,6 @@ images_for_warping/
 warped_dataset/
 warped_dataset_greenscreen/
 warped_dataset_nobackground/
+
+# Captured background frame (regenerated at startup)
+installation_mirror/assets/background_captures/
